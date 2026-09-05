@@ -74,7 +74,8 @@ async def cmd_start(message: types.Message):
     conn.close()
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛒 Открыть CS:GO Market", web_app=WebAppInfo(url=WEBAPP_URL))]
+    [InlineKeyboardButton(text="🔥 Открыть CS:GO Market", url="https://t.me/market_02_bot/app")]
+])
     ])
     await message.answer(
         f"Привет, {user.first_name}! Добро пожаловать в CS:GO Market.\n\n"
