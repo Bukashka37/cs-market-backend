@@ -2,18 +2,19 @@ import os
 import json
 import base64
 import sqlite3
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, BufferedInputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
 # --- Конфигурация из переменных окружения ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "707417409"))
-CHANNEL_STORAGE_ID = int(os.getenv("CHANNEL_STORAGE_ID", "0"))
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://your-username.github.io/cs-market-app/")
+CHANNEL_STORAGE_ID = int(os.getenv("CHANNEL_STORAGE_ID", "-1003931747114"))
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bukashka37.github.io/cs-market-app/")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -43,24 +44,7 @@ def init_db():
 
 init_db()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # При старте запускаем вебхук или фоновое чтение
-    yield
-    await bot.session.close()
-
-app = FastAPI(lifespan=lifespan)
-
-# Разрешаем запросы из Mini App
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Стартовое сообщение бота с кнопкой запуска Mini App
+# --- Обработка команды /start ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     user = message.from_user
@@ -73,14 +57,41 @@ async def cmd_start(message: types.Message):
     conn.commit()
     conn.close()
 
+    # Стираем старое кнопочное меню из чата
+    clear_msg = await message.answer("...", reply_markup=types.ReplyKeyboardRemove())
+    await clear_msg.delete()
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="🔥 Открыть CS:GO Market", url="https://t.me/market_02_bot/app")]
-])
+        [InlineKeyboardButton(text="🔥 Открыть CS:GO Market", url="https://t.me/market_02_bot/app")]
+    ])
     await message.answer(
         f"Привет, {user.first_name}! Добро пожаловать в CS:GO Market.\n\n"
         f"Здесь вы можете приобрести скины, донат, игры или забрать бесплатные скины за простые задания!",
         reply_markup=kb
     )
+
+# --- Фоновый запуск опроса сообщений Telegram ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    polling_task = asyncio.create_task(dp.start_polling(bot))
+    yield
+    polling_task.cancel()
+    await bot.session.close()
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Корневой роут для пинга UptimeRobot (отдает 200 OK вместо 404)
+@app.get("/")
+async def health_check():
+    return {"status": "ok"}
 
 # Приём скриншотов и отправка в закрытый канал
 @app.post("/api/upload_proof")
@@ -94,7 +105,6 @@ async def upload_proof(request: Request):
     if not img_base64:
         return {"ok": False, "error": "No image"}
 
-    # Преобразуем base64 в бинарный файл
     header, encoded = img_base64.split(",", 1) if "," in img_base64 else ("", img_base64)
     image_bytes = base64.b64decode(encoded)
     file_payload = BufferedInputFile(image_bytes, filename="proof.jpg")
@@ -105,11 +115,9 @@ async def upload_proof(request: Request):
         f"🎯 Задание: <b>{task_title}</b>"
     )
 
-    # Отправляем фото в закрытый канал-хранилище
     msg = await bot.send_photo(chat_id=CHANNEL_STORAGE_ID, photo=file_payload, caption=caption, parse_mode="HTML")
     photo_file_id = msg.photo[-1].file_id
 
-    # Присылаем уведомление админу в ЛС
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]
     ])
@@ -122,7 +130,7 @@ async def upload_proof(request: Request):
 
     return {"ok": True, "fileId": photo_file_id}
 
-# Проверка реферала (заходил ли друг в бота)
+# Проверка рефералов
 @app.post("/api/check_referral")
 async def check_referral(request: Request):
     data = await request.json()
