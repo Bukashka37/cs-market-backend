@@ -31,7 +31,6 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
-            balance REAL DEFAULT 0,
             last_active TEXT
         )
     """)
@@ -58,12 +57,6 @@ def init_db():
             created_at TEXT
         )
     """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
     conn.commit()
     conn.close()
 
@@ -71,7 +64,8 @@ init_db()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    polling_task = asyncio.create_task(dp.start_polling(bot))
+    # Запускаем polling в отдельной изолированной задаче
+    polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
     yield
     polling_task.cancel()
     await bot.session.close()
@@ -86,8 +80,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-async def root():
+# Корневой маршрут: Render сразу получает статус 200 OK и деплоит за 30 секунд
+@app.api_route("/", methods=["GET", "HEAD"])
+async def health_check():
     return {"status": "ok"}
 
 @dp.message(CommandStart())
@@ -107,8 +102,11 @@ async def cmd_start(message: types.Message):
     conn.commit()
     conn.close()
 
-    clear_msg = await message.answer("...", reply_markup=types.ReplyKeyboardRemove())
-    await clear_msg.delete()
+    try:
+        clear_msg = await message.answer("...", reply_markup=types.ReplyKeyboardRemove())
+        await clear_msg.delete()
+    except Exception:
+        pass
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔥 Открыть CS:GO Market", url="https://t.me/market_02_bot/app")]
@@ -119,7 +117,7 @@ async def cmd_start(message: types.Message):
         reply_markup=kb
     )
 
-# 1. Синхронизация профиля при открытии Mini App с любого устройства
+# 1. Синхронизация профиля по числовому Telegram ID (одинаково на ПК и телефоне)
 @app.post("/api/user/sync")
 async def sync_user(request: Request):
     data = await request.json()
@@ -139,26 +137,46 @@ async def sync_user(request: Request):
             last_active=excluded.last_active
     """, (user_id, username, first_name, now))
 
-    # Запись события входа в общую лайв-ленту
+    # Фиксация входа в лайв-ленту
     cur.execute("""
         INSERT INTO live_feed (user_id, username, action_type, title, created_at)
         VALUES (?, ?, 'login', 'Вход в приложение', ?)
     """, (user_id, username, now))
 
-    # Получаем все задачи пользователя
+    # Считываем актуальные задания пользователя из общей БД
     cur.execute("SELECT task_key, status, reject_reason FROM tasks WHERE user_id = ?", (user_id,))
-    user_tasks = {row["task_key"]: {"status": row["status"], "reason": row["reject_reason"]} for row in cur.fetchall()}
-
-    # Получаем настройки ссылок
-    cur.execute("SELECT key, value FROM settings")
-    settings = {row["key"]: row["value"] for row in cur.fetchall()}
+    tasks = {row["task_key"]: {"status": row["status"], "reason": row["reject_reason"]} for row in cur.fetchall()}
 
     conn.commit()
     conn.close()
+    return {"ok": True, "tasks": tasks}
 
-    return {"ok": True, "tasks": user_tasks, "settings": settings}
+# 2. Фиксация начала выполнения задания
+@app.post("/api/task/start")
+async def start_task(request: Request):
+    data = await request.json()
+    user_id = data.get("userId")
+    username = (data.get("username") or "client").replace("@", "")
+    task_key = data.get("taskKey")
+    task_title = data.get("taskTitle", "Задание")
+    now = datetime.now().strftime("%H:%M")
 
-# 2. Отправка задания / скрина (без закрытия WebApp)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tasks (user_id, username, task_key, task_title, status, created_at)
+        VALUES (?, ?, ?, ?, 'in_progress', ?)
+    """, (user_id, username, task_key, task_title, now))
+
+    cur.execute("""
+        INSERT INTO live_feed (user_id, username, action_type, title, created_at)
+        VALUES (?, ?, 'task_start', ?, ?)
+    """, (user_id, username, f"Начал задание: {task_title}", now))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+# 3. Сдача задания / отправка скриншота
 @app.post("/api/task/submit")
 async def submit_task(request: Request):
     data = await request.json()
@@ -171,50 +189,60 @@ async def submit_task(request: Request):
 
     photo_file_id = None
     if img_base64:
-        header, encoded = img_base64.split(",", 1) if "," in img_base64 else ("", img_base64)
-        image_bytes = base64.b64decode(encoded)
-        file_payload = BufferedInputFile(image_bytes, filename="proof.jpg")
-        caption = f"📸 <b>Скриншот на проверку!</b>\n👤 @{username} (ID: <code>{user_id}</code>)\n🎯 <b>{task_title}</b>"
-        msg = await bot.send_photo(chat_id=CHANNEL_STORAGE_ID, photo=file_payload, caption=caption, parse_mode="HTML")
-        photo_file_id = msg.photo[-1].file_id
+        try:
+            header, encoded = img_base64.split(",", 1) if "," in img_base64 else ("", img_base64)
+            image_bytes = base64.b64decode(encoded)
+            file_payload = BufferedInputFile(image_bytes, filename="proof.jpg")
+            caption = f"📸 <b>Скриншот на проверку!</b>\n👤 @{username} (ID: <code>{user_id}</code>)\n🎯 <b>{task_title}</b>"
+            msg = await bot.send_photo(chat_id=CHANNEL_STORAGE_ID, photo=file_payload, caption=caption, parse_mode="HTML")
+            photo_file_id = msg.photo[-1].file_id
+        except Exception as e:
+            print("Ошибка отправки фото в канал:", e)
 
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO tasks (user_id, username, task_key, task_title, status, screenshot_id, created_at)
-        VALUES (?, ?, ?, ?, 'pending', ?, ?)
-    """, (user_id, username, task_key, task_title, photo_file_id, now))
+        UPDATE tasks SET status = 'pending', screenshot_id = ? WHERE user_id = ? AND task_key = ?
+    """, (photo_file_id, user_id, task_key))
+    if cur.rowcount == 0:
+        cur.execute("""
+            INSERT INTO tasks (user_id, username, task_key, task_title, status, screenshot_id, created_at)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?)
+        """, (user_id, username, task_key, task_title, photo_file_id, now))
 
     cur.execute("""
         INSERT INTO live_feed (user_id, username, action_type, title, created_at)
-        VALUES (?, ?, 'task', ?, ?)
-    """, (user_id, username, f"Сдал задание: {task_title}", now))
+        VALUES (?, ?, 'task_submit', ?, ?)
+    """, (user_id, username, f"Отправил на проверку: {task_title}", now))
     conn.commit()
     conn.close()
 
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Написать", url=f"https://t.me/{username}")]
-    ])
-    await bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"🔔 <b>Новая заявка на проверку!</b>\nЗадание: <b>{task_title}</b>\nОт: @{username}",
-        reply_markup=admin_kb,
-        parse_mode="HTML"
-    )
+    try:
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]
+        ])
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🔔 <b>Новая заявка на проверку!</b>\nЗадание: <b>{task_title}</b>\nОт: @{username}",
+            reply_markup=admin_kb,
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
 
     return {"ok": True}
 
-# 3. Получение общей лайв-ленты для админки
+# 4. Общая лайв-лента всех пользователей для админки
 @app.get("/api/admin/live_feed")
 async def get_live_feed():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT user_id, username, action_type, title, created_at FROM live_feed ORDER BY id DESC LIMIT 40")
+    cur.execute("SELECT user_id, username, action_type, title, created_at FROM live_feed ORDER BY id DESC LIMIT 50")
     rows = cur.fetchall()
     conn.close()
     return [{"userId": r["user_id"], "username": r["username"], "type": r["action_type"], "title": r["title"], "time": r["created_at"]} for r in rows]
 
-# 4. Проверка реферала
+# 5. Проверка реферала
 @app.post("/api/check_referral")
 async def check_referral(request: Request):
     data = await request.json()
