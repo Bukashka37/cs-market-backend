@@ -80,6 +80,15 @@ def init_db():
         )
     """)
     conn.commit()
+
+    # Очистка накопленных дубликатов заказов (оставляем только уникальные)
+    cur.execute("""
+        DELETE FROM market_orders 
+        WHERE id NOT IN (
+            SELECT MIN(id) FROM market_orders GROUP BY user_id, service_key, comment, status
+        )
+    """)
+    conn.commit()
     conn.close()
 
 init_db()
@@ -141,7 +150,7 @@ async def cmd_start(message: types.Message):
         reply_markup=kb
     )
 
-# --- ГЛАВНЫЙ СИНХРОНИЗАТОР ---
+# МГНОВЕННЫЙ СИНХРОНИЗАТОР БЕЗ ПЕТЕЛЬ
 @app.post("/api/sync")
 async def sync_all(request: Request):
     data = await request.json()
@@ -149,12 +158,10 @@ async def sync_all(request: Request):
     username = (data.get("username") or "user").replace("@", "").lower().strip()
     first_name = data.get("firstName", "Пользователь")
     now_time = datetime.now().strftime("%H:%M")
-    now_ts = int(datetime.now().timestamp() * 1000)
 
     conn = get_db()
     cur = conn.cursor()
 
-    # 1. Фиксация пользователя в базе (нужно для рефералов и ленты)
     cur.execute("""
         INSERT INTO users (user_id, username, first_name, last_active)
         VALUES (?, ?, ?, ?)
@@ -164,29 +171,7 @@ async def sync_all(request: Request):
             last_active=excluded.last_active
     """, (user_id, username, first_name, now_time))
 
-    # 2. Автомиграция старых локальных заданий (если с телефона прилетел VPN и др.)
-    migrate_tasks = data.get("migrateTasks", {})
-    if isinstance(migrate_tasks, dict):
-        for t_key, t_val in migrate_tasks.items():
-            if isinstance(t_val, dict) and t_val.get("status") and t_val.get("status") != "idle":
-                cur.execute("""
-                    INSERT OR IGNORE INTO tasks (user_id, task_key, status, reason, idea_title, idea_desc, reward_requested, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (user_id, t_key, t_val.get("status"), t_val.get("reason", ""), t_val.get("ideaTitle", ""), t_val.get("ideaDesc", ""), 1 if t_val.get("rewardRequested") else 0, now_time))
-
-    # 3. Автомиграция заказов маркета
-    migrate_orders = data.get("migrateOrders", [])
-    if isinstance(migrate_orders, list):
-        for o in migrate_orders:
-            if o.get("status") == "new":
-                cur.execute("""
-                    INSERT OR IGNORE INTO market_orders (user_id, username, first_name, service_key, service_title, comment, status, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'new', ?)
-                """, (user_id, username, first_name, o.get("serviceKey", "custom"), o.get("serviceTitle", "Товар"), o.get("comment", ""), o.get("time", now_time)))
-
-    conn.commit()
-
-    # 4. Считываем актуальные данные из единой БД
+    # Считываем актуальные задания пользователя
     cur.execute("SELECT task_key, status, reason, idea_title, idea_desc, reward_requested FROM tasks WHERE user_id = ?", (user_id,))
     tasks_db = {}
     for r in cur.fetchall():
@@ -198,7 +183,8 @@ async def sync_all(request: Request):
             "rewardRequested": bool(r["reward_requested"])
         }
 
-    cur.execute("SELECT id, user_id, username, first_name, service_key, service_title, comment, status, created_at FROM market_orders WHERE status = 'new' ORDER BY id DESC")
+    # Считываем реальные заказы маркета (без дубликатов)
+    cur.execute("SELECT id, user_id, username, first_name, service_key, service_title, comment, status, created_at FROM market_orders WHERE status = 'new' ORDER BY id DESC LIMIT 50")
     orders_db = []
     for r in cur.fetchall():
         orders_db.append({
@@ -212,7 +198,8 @@ async def sync_all(request: Request):
             "time": r["created_at"]
         })
 
-    cur.execute("SELECT user_name, username, user_id, text, tag, icon, created_at, timestamp FROM live_feed ORDER BY id DESC LIMIT 50")
+    # Считываем лайв-ленту
+    cur.execute("SELECT user_name, username, user_id, text, tag, icon, created_at, timestamp FROM live_feed ORDER BY id DESC LIMIT 30")
     feed_db = []
     for r in cur.fetchall():
         feed_db.append({
@@ -229,10 +216,11 @@ async def sync_all(request: Request):
     ozon_row = cur.fetchone()
     ozon_data = json.loads(ozon_row["value"]) if ozon_row else None
 
+    conn.commit()
     conn.close()
     return {"ok": True, "tasksState": tasks_db, "marketOrders": orders_db, "liveFeed": feed_db, "ozonCard": ozon_data}
 
-# Фиксация события в единой лайв-ленте
+# Запись в лайв-ленту
 @app.post("/api/activity/log")
 async def log_activity(request: Request):
     data = await request.json()
@@ -249,7 +237,7 @@ async def log_activity(request: Request):
     conn.close()
     return {"ok": True}
 
-# Обновление статуса задания клиентом или админом
+# Обновление заданий
 @app.post("/api/task/update")
 async def update_task(request: Request):
     data = await request.json()
@@ -279,7 +267,7 @@ async def update_task(request: Request):
     conn.close()
     return {"ok": True}
 
-# Отправка скриншота на проверку
+# Приём скриншота
 @app.post("/api/task/submit_proof")
 async def submit_proof(request: Request):
     data = await request.json()
@@ -327,7 +315,7 @@ async def submit_proof(request: Request):
 
     return {"ok": True}
 
-# Создание заказа в маркете
+# Оформление заказа (строго 1 запись в базу)
 @app.post("/api/order/create")
 async def create_order(request: Request):
     data = await request.json()
@@ -377,7 +365,7 @@ async def complete_order(request: Request):
     conn.close()
     return {"ok": True}
 
-# Обновление ссылки Ozon админом
+# Обновление Ozon
 @app.post("/api/ozon/update")
 async def update_ozon(request: Request):
     data = await request.json()
@@ -391,7 +379,7 @@ async def update_ozon(request: Request):
     conn.close()
     return {"ok": True}
 
-# Проверка рефералов по реальной базе
+# Рефералы
 @app.post("/api/check_referral")
 async def check_referral(request: Request):
     data = await request.json()
