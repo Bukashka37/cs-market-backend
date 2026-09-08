@@ -74,6 +74,16 @@ def init_db():
         )
     """)
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS referrals (
+            user_id INTEGER,
+            friend_username TEXT,
+            friend_name TEXT,
+            earned REAL DEFAULT 0,
+            created_at TEXT,
+            PRIMARY KEY (user_id, friend_username)
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -81,7 +91,7 @@ def init_db():
     """)
     conn.commit()
 
-    # Очистка накопленных дубликатов заказов (оставляем только уникальные)
+    # Очистка дубликатов заказов, если они накопились
     cur.execute("""
         DELETE FROM market_orders 
         WHERE id NOT IN (
@@ -118,10 +128,13 @@ app.add_middleware(
 async def health_check():
     return {"status": "ok"}
 
+# Фиксация пользователей при команде /start
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     user = message.from_user
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_time = datetime.now().strftime("%H:%M")
+    now_ts = int(datetime.now().timestamp() * 1000)
+
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
@@ -131,7 +144,13 @@ async def cmd_start(message: types.Message):
             username=excluded.username,
             first_name=excluded.first_name,
             last_active=excluded.last_active
-    """, (user.id, (user.username or "").lower(), user.first_name, now))
+    """, (user.id, (user.username or "").lower(), user.first_name, now_time))
+
+    cur.execute("""
+        INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+        VALUES (?, ?, ?, 'Запустил бота в Telegram', 'bot_start', 'smart_toy', ?, ?)
+    """, (user.id, (user.username or "").lower(), user.first_name, now_time, now_ts))
+
     conn.commit()
     conn.close()
 
@@ -150,7 +169,7 @@ async def cmd_start(message: types.Message):
         reply_markup=kb
     )
 
-# МГНОВЕННЫЙ СИНХРОНИЗАТОР БЕЗ ПЕТЕЛЬ
+# ГЛАВНЫЙ СИНХРОНИЗАТОР
 @app.post("/api/sync")
 async def sync_all(request: Request):
     data = await request.json()
@@ -158,10 +177,12 @@ async def sync_all(request: Request):
     username = (data.get("username") or "user").replace("@", "").lower().strip()
     first_name = data.get("firstName", "Пользователь")
     now_time = datetime.now().strftime("%H:%M")
+    now_ts = int(datetime.now().timestamp() * 1000)
 
     conn = get_db()
     cur = conn.cursor()
 
+    # 1. Запись пользователя в базу
     cur.execute("""
         INSERT INTO users (user_id, username, first_name, last_active)
         VALUES (?, ?, ?, ?)
@@ -171,7 +192,16 @@ async def sync_all(request: Request):
             last_active=excluded.last_active
     """, (user_id, username, first_name, now_time))
 
-    # Считываем актуальные задания пользователя
+    # 2. Автоматическая запись входа в лайв-ленту (не чаще 1 раза в 15 минут)
+    cur.execute("SELECT timestamp FROM live_feed WHERE user_id = ? AND tag = 'login' ORDER BY id DESC LIMIT 1", (user_id,))
+    last_log = cur.fetchone()
+    if not last_log or (now_ts - last_log["timestamp"]) > 900000:
+        cur.execute("""
+            INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+            VALUES (?, ?, ?, 'Открыл приложение CS:GO Market', 'login', 'login', ?, ?)
+        """, (user_id, username, first_name, now_time, now_ts))
+
+    # 3. Получение заданий пользователя
     cur.execute("SELECT task_key, status, reason, idea_title, idea_desc, reward_requested FROM tasks WHERE user_id = ?", (user_id,))
     tasks_db = {}
     for r in cur.fetchall():
@@ -183,7 +213,11 @@ async def sync_all(request: Request):
             "rewardRequested": bool(r["reward_requested"])
         }
 
-    # Считываем реальные заказы маркета (без дубликатов)
+    # 4. Получение рефералов
+    cur.execute("SELECT friend_username, friend_name, earned, created_at FROM referrals WHERE user_id = ?", (user_id,))
+    refs_db = [{"username": f"@{r['friend_username']}", "tasksCount": 0, "earned": r["earned"], "date": r["created_at"]} for r in cur.fetchall()]
+
+    # 5. Получение заказов для админки
     cur.execute("SELECT id, user_id, username, first_name, service_key, service_title, comment, status, created_at FROM market_orders WHERE status = 'new' ORDER BY id DESC LIMIT 50")
     orders_db = []
     for r in cur.fetchall():
@@ -198,8 +232,8 @@ async def sync_all(request: Request):
             "time": r["created_at"]
         })
 
-    # Считываем лайв-ленту
-    cur.execute("SELECT user_name, username, user_id, text, tag, icon, created_at, timestamp FROM live_feed ORDER BY id DESC LIMIT 30")
+    # 6. Получение единой лайв-ленты всех пользователей
+    cur.execute("SELECT user_name, username, user_id, text, tag, icon, created_at, timestamp FROM live_feed ORDER BY id DESC LIMIT 40")
     feed_db = []
     for r in cur.fetchall():
         feed_db.append({
@@ -218,26 +252,95 @@ async def sync_all(request: Request):
 
     conn.commit()
     conn.close()
-    return {"ok": True, "tasksState": tasks_db, "marketOrders": orders_db, "liveFeed": feed_db, "ozonCard": ozon_data}
 
-# Запись в лайв-ленту
-@app.post("/api/activity/log")
-async def log_activity(request: Request):
+    return {
+        "ok": True,
+        "tasksState": tasks_db,
+        "marketOrders": orders_db,
+        "liveFeed": feed_db,
+        "referrals": refs_db,
+        "ozonCard": ozon_data
+    }
+
+# Запрос ссылки Ozon (НЕ переводит задание на проверку!)
+@app.post("/api/ozon/request")
+async def request_ozon(request: Request):
     data = await request.json()
+    user_id = data.get("userId")
+    username = (data.get("username") or "client").replace("@", "")
+    first_name = data.get("firstName", "Клиент")
     now_time = datetime.now().strftime("%H:%M")
     now_ts = int(datetime.now().timestamp() * 1000)
 
     conn = get_db()
     cur = conn.cursor()
+    cur.execute("SELECT value FROM app_settings WHERE key = 'ozon_card'")
+    row = cur.fetchone()
+    current_ozon = json.loads(row["value"]) if row and row["value"] else {}
+    current_ozon["status"] = "requested"
+    cur.execute("""
+        INSERT INTO app_settings (key, value) VALUES ('ozon_card', ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """, (json.dumps(current_ozon),))
+
     cur.execute("""
         INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (data.get("userId"), data.get("username", "").replace("@", ""), data.get("user", "Клиент"), data.get("text", ""), data.get("tag", "action"), data.get("icon", "bolt"), now_time, now_ts))
+        VALUES (?, ?, ?, 'Запросил персональную ссылку Ozon (72ч)', 'request', 'shopping_basket', ?, ?)
+    """, (user_id, username, first_name, now_time, now_ts))
+    conn.commit()
+    conn.close()
+
+    try:
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]
+        ])
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"⏳ <b>Запрос ссылки Ozon Карты!</b>\nКлиент: @{username} (ID: <code>{user_id}</code>)\nПерейдите в Админку ➔ Выдача данных и выдайте ссылку.",
+            reply_markup=admin_kb,
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    return {"ok": True}
+
+# Проверка реферала (поиск в SQLite без учёта регистра)
+@app.post("/api/check_referral")
+async def check_referral(request: Request):
+    data = await request.json()
+    ref_username = (data.get("username") or "").replace("@", "").lower().strip()
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, first_name, username FROM users WHERE LOWER(username) = ?", (ref_username,))
+    row = cur.fetchone()
+    conn.close()
+
+    if row:
+        return {"exists": True, "userId": row["user_id"], "name": row["first_name"]}
+    return {"exists": False}
+
+# Добавление друга в рефералы
+@app.post("/api/referral/add")
+async def add_referral(request: Request):
+    data = await request.json()
+    user_id = data.get("userId")
+    friend_username = (data.get("friendUsername") or "").replace("@", "").lower().strip()
+    friend_name = data.get("friendName", friend_username)
+    now_date = datetime.now().strftime("%d.%m.%Y")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO referrals (user_id, friend_username, friend_name, earned, created_at)
+        VALUES (?, ?, ?, 0, ?)
+    """, (user_id, friend_username, friend_name, now_date))
     conn.commit()
     conn.close()
     return {"ok": True}
 
-# Обновление заданий
+# Обновление статуса задания
 @app.post("/api/task/update")
 async def update_task(request: Request):
     data = await request.json()
@@ -267,7 +370,7 @@ async def update_task(request: Request):
     conn.close()
     return {"ok": True}
 
-# Приём скриншота
+# Отправка скриншота
 @app.post("/api/task/submit_proof")
 async def submit_proof(request: Request):
     data = await request.json()
@@ -315,7 +418,7 @@ async def submit_proof(request: Request):
 
     return {"ok": True}
 
-# Оформление заказа (строго 1 запись в базу)
+# Создание заказа маркета
 @app.post("/api/order/create")
 async def create_order(request: Request):
     data = await request.json()
@@ -357,7 +460,6 @@ async def create_order(request: Request):
 async def complete_order(request: Request):
     data = await request.json()
     order_id = data.get("orderId")
-
     conn = get_db()
     cur = conn.cursor()
     cur.execute("UPDATE market_orders SET status = 'completed' WHERE id = ?", (order_id,))
@@ -365,7 +467,7 @@ async def complete_order(request: Request):
     conn.close()
     return {"ok": True}
 
-# Обновление Ozon
+# Выдача / обновление ссылки Ozon админом
 @app.post("/api/ozon/update")
 async def update_ozon(request: Request):
     data = await request.json()
@@ -379,18 +481,19 @@ async def update_ozon(request: Request):
     conn.close()
     return {"ok": True}
 
-# Рефералы
-@app.post("/api/check_referral")
-async def check_referral(request: Request):
+# Логирование активности
+@app.post("/api/activity/log")
+async def log_activity(request: Request):
     data = await request.json()
-    ref_username = (data.get("username") or "").replace("@", "").lower().strip()
+    now_time = datetime.now().strftime("%H:%M")
+    now_ts = int(datetime.now().timestamp() * 1000)
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT user_id, first_name FROM users WHERE username = ?", (ref_username,))
-    row = cur.fetchone()
+    cur.execute("""
+        INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (data.get("userId"), data.get("username", "").replace("@", ""), data.get("user", "Клиент"), data.get("text", ""), data.get("tag", "action"), data.get("icon", "bolt"), now_time, now_ts))
+    conn.commit()
     conn.close()
-
-    if row:
-        return {"exists": True, "userId": row["user_id"], "name": row["first_name"]}
-    return {"exists": False}
+    return {"ok": True}
