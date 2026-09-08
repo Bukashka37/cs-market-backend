@@ -90,8 +90,6 @@ def init_db():
         )
     """)
     conn.commit()
-
-    # Очистка дубликатов заказов, если они накопились
     cur.execute("""
         DELETE FROM market_orders 
         WHERE id NOT IN (
@@ -128,7 +126,6 @@ app.add_middleware(
 async def health_check():
     return {"status": "ok"}
 
-# Фиксация пользователей при команде /start
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     user = message.from_user
@@ -169,7 +166,6 @@ async def cmd_start(message: types.Message):
         reply_markup=kb
     )
 
-# ГЛАВНЫЙ СИНХРОНИЗАТОР
 @app.post("/api/sync")
 async def sync_all(request: Request):
     data = await request.json()
@@ -227,6 +223,7 @@ async def sync_all(request: Request):
 
     conn.commit()
 
+    # Задания текущего юзера
     cur.execute("SELECT task_key, status, reason, idea_title, idea_desc, reward_requested FROM tasks WHERE user_id = ?", (user_id,))
     tasks_db = {}
     for r in cur.fetchall():
@@ -237,6 +234,28 @@ async def sync_all(request: Request):
             "ideaDesc": r["idea_desc"],
             "rewardRequested": bool(r["reward_requested"])
         }
+        
+    # ВСЕ ЗАДАНИЯ ВСЕХ ЮЗЕРОВ (ТОЛЬКО ДЛЯ АДМИНА)
+    admin_tasks_db = []
+    if user_id == ADMIN_ID:
+        cur.execute("""
+            SELECT t.user_id, t.task_key, t.status, t.idea_title, t.idea_desc, t.reward_requested, u.username, u.first_name, t.updated_at
+            FROM tasks t
+            LEFT JOIN users u ON t.user_id = u.user_id
+            WHERE t.status IN ('in_progress', 'accepted') OR t.reward_requested = 1
+        """)
+        for r in cur.fetchall():
+            admin_tasks_db.append({
+                "userId": r["user_id"],
+                "taskKey": r["task_key"],
+                "status": r["status"],
+                "ideaTitle": r["idea_title"],
+                "ideaDesc": r["idea_desc"],
+                "rewardRequested": bool(r["reward_requested"]),
+                "username": r["username"] or "",
+                "firstName": r["first_name"] or "Клиент",
+                "time": r["updated_at"]
+            })
 
     cur.execute("SELECT friend_username, friend_name, earned, created_at FROM referrals WHERE user_id = ?", (user_id,))
     refs_db = [{"username": f"@{r['friend_username']}", "tasksCount": 0, "earned": r["earned"], "date": r["created_at"]} for r in cur.fetchall()]
@@ -277,13 +296,13 @@ async def sync_all(request: Request):
     return {
         "ok": True,
         "tasksState": tasks_db,
+        "adminTasks": admin_tasks_db,
         "marketOrders": orders_db,
         "liveFeed": feed_db,
         "referrals": refs_db,
         "ozonCard": ozon_data
     }
 
-# Запрос ссылки Ozon (НЕ переводит задание на проверку!)
 @app.post("/api/ozon/request")
 async def request_ozon(request: Request):
     data = await request.json()
@@ -326,7 +345,6 @@ async def request_ozon(request: Request):
 
     return {"ok": True}
 
-# Проверка реферала
 @app.post("/api/check_referral")
 async def check_referral(request: Request):
     data = await request.json()
@@ -342,7 +360,6 @@ async def check_referral(request: Request):
         return {"exists": True, "userId": row["user_id"], "name": row["first_name"]}
     return {"exists": False}
 
-# Добавление друга в рефералы
 @app.post("/api/referral/add")
 async def add_referral(request: Request):
     data = await request.json()
@@ -361,7 +378,6 @@ async def add_referral(request: Request):
     conn.close()
     return {"ok": True}
 
-# Обновление статуса задания
 @app.post("/api/task/update")
 async def update_task(request: Request):
     data = await request.json()
@@ -391,7 +407,6 @@ async def update_task(request: Request):
     conn.close()
     return {"ok": True}
 
-# Отправка скриншота
 @app.post("/api/task/submit_proof")
 async def submit_proof(request: Request):
     data = await request.json()
@@ -439,7 +454,6 @@ async def submit_proof(request: Request):
 
     return {"ok": True}
 
-# Создание заказа маркета
 @app.post("/api/order/create")
 async def create_order(request: Request):
     data = await request.json()
@@ -476,7 +490,6 @@ async def create_order(request: Request):
 
     return {"ok": True, "orderId": order_id}
 
-# Завершение заказа админом
 @app.post("/api/order/complete")
 async def complete_order(request: Request):
     data = await request.json()
@@ -488,7 +501,6 @@ async def complete_order(request: Request):
     conn.close()
     return {"ok": True}
 
-# Обновление Ozon админом
 @app.post("/api/ozon/update")
 async def update_ozon(request: Request):
     data = await request.json()
@@ -502,7 +514,6 @@ async def update_ozon(request: Request):
     conn.close()
     return {"ok": True}
 
-# Логирование активности
 @app.post("/api/activity/log")
 async def log_activity(request: Request):
     data = await request.json()
