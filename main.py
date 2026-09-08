@@ -182,7 +182,6 @@ async def sync_all(request: Request):
     conn = get_db()
     cur = conn.cursor()
 
-    # 1. Запись пользователя в базу
     cur.execute("""
         INSERT INTO users (user_id, username, first_name, last_active)
         VALUES (?, ?, ?, ?)
@@ -192,7 +191,6 @@ async def sync_all(request: Request):
             last_active=excluded.last_active
     """, (user_id, username, first_name, now_time))
 
-    # 2. Автоматическая запись входа в лайв-ленту (не чаще 1 раза в 15 минут)
     cur.execute("SELECT timestamp FROM live_feed WHERE user_id = ? AND tag = 'login' ORDER BY id DESC LIMIT 1", (user_id,))
     last_log = cur.fetchone()
     if not last_log or (now_ts - last_log["timestamp"]) > 900000:
@@ -201,7 +199,34 @@ async def sync_all(request: Request):
             VALUES (?, ?, ?, 'Открыл приложение CS:GO Market', 'login', 'login', ?, ?)
         """, (user_id, username, first_name, now_time, now_ts))
 
-    # 3. Получение заданий пользователя
+    migrate_tasks = data.get("migrateTasks", {})
+    if isinstance(migrate_tasks, dict):
+        for t_key, t_val in migrate_tasks.items():
+            t_status = "idle"
+            t_reason = ""
+            if isinstance(t_val, dict):
+                t_status = t_val.get("status", "idle")
+                t_reason = t_val.get("reason", "")
+            elif isinstance(t_val, str):
+                t_status = t_val
+
+            if t_status and t_status != "idle":
+                cur.execute("""
+                    INSERT OR IGNORE INTO tasks (user_id, task_key, status, reason, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (user_id, t_key, t_status, t_reason, now_time))
+
+    migrate_orders = data.get("migrateOrders", [])
+    if isinstance(migrate_orders, list):
+        for o in migrate_orders:
+            if o.get("status") == "new":
+                cur.execute("""
+                    INSERT OR IGNORE INTO market_orders (user_id, username, first_name, service_key, service_title, comment, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'new', ?)
+                """, (user_id, username, first_name, o.get("serviceKey", "custom"), o.get("serviceTitle", "Товар"), o.get("comment", ""), o.get("time", now_time)))
+
+    conn.commit()
+
     cur.execute("SELECT task_key, status, reason, idea_title, idea_desc, reward_requested FROM tasks WHERE user_id = ?", (user_id,))
     tasks_db = {}
     for r in cur.fetchall():
@@ -213,11 +238,9 @@ async def sync_all(request: Request):
             "rewardRequested": bool(r["reward_requested"])
         }
 
-    # 4. Получение рефералов
     cur.execute("SELECT friend_username, friend_name, earned, created_at FROM referrals WHERE user_id = ?", (user_id,))
     refs_db = [{"username": f"@{r['friend_username']}", "tasksCount": 0, "earned": r["earned"], "date": r["created_at"]} for r in cur.fetchall()]
 
-    # 5. Получение заказов для админки
     cur.execute("SELECT id, user_id, username, first_name, service_key, service_title, comment, status, created_at FROM market_orders WHERE status = 'new' ORDER BY id DESC LIMIT 50")
     orders_db = []
     for r in cur.fetchall():
@@ -232,7 +255,6 @@ async def sync_all(request: Request):
             "time": r["created_at"]
         })
 
-    # 6. Получение единой лайв-ленты всех пользователей
     cur.execute("SELECT user_name, username, user_id, text, tag, icon, created_at, timestamp FROM live_feed ORDER BY id DESC LIMIT 40")
     feed_db = []
     for r in cur.fetchall():
@@ -250,7 +272,6 @@ async def sync_all(request: Request):
     ozon_row = cur.fetchone()
     ozon_data = json.loads(ozon_row["value"]) if ozon_row else None
 
-    conn.commit()
     conn.close()
 
     return {
@@ -305,7 +326,7 @@ async def request_ozon(request: Request):
 
     return {"ok": True}
 
-# Проверка реферала (поиск в SQLite без учёта регистра)
+# Проверка реферала
 @app.post("/api/check_referral")
 async def check_referral(request: Request):
     data = await request.json()
@@ -389,7 +410,7 @@ async def submit_proof(request: Request):
             caption = f"📸 <b>Скриншот задания!</b>\n👤 @{username} (ID: <code>{user_id}</code>)\n🎯 <b>{task_title}</b>"
             await bot.send_photo(chat_id=CHANNEL_STORAGE_ID, photo=file_payload, caption=caption, parse_mode="HTML")
         except Exception as e:
-            print("Ошибка отправки скриншота:", e)
+            pass
 
     conn = get_db()
     cur = conn.cursor()
@@ -467,7 +488,7 @@ async def complete_order(request: Request):
     conn.close()
     return {"ok": True}
 
-# Выдача / обновление ссылки Ozon админом
+# Обновление Ozon админом
 @app.post("/api/ozon/update")
 async def update_ozon(request: Request):
     data = await request.json()
