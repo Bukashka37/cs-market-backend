@@ -163,6 +163,8 @@ async def sync_all(request: Request):
     user_id = data.get("userId")
     username = (data.get("username") or "user").replace("@", "").lower().strip()
     first_name = data.get("firstName", "Пользователь")
+    is_admin = data.get("isAdmin", False)
+    
     now_time = datetime.now().strftime("%H:%M")
     now_ts = int(datetime.now().timestamp() * 1000)
 
@@ -191,7 +193,8 @@ async def sync_all(request: Request):
     tasks_db = {r["task_key"]: {"status": r["status"], "reason": r["reason"], "ideaTitle": r["idea_title"], "ideaDesc": r["idea_desc"], "rewardRequested": bool(r["reward_requested"])} for r in cur.fetchall()}
         
     admin_tasks_db = []
-    if str(user_id) == str(ADMIN_ID):
+    # Если это админ по ID или залогинился по паролю
+    if str(user_id) == str(ADMIN_ID) or is_admin:
         cur.execute("""
             SELECT t.user_id, t.task_key, t.status, t.idea_title, t.idea_desc, t.reward_requested, u.username, u.first_name, t.updated_at
             FROM tasks t LEFT JOIN users u ON t.user_id = u.user_id
@@ -241,7 +244,7 @@ async def save_settings(request: Request):
     conn = get_db()
     cur = conn.cursor()
     for k, v in data.items():
-        if k not in ["userId", "username", "firstName"]:
+        if k not in ["userId", "username", "firstName", "isAdmin"]:
             cur.execute("""
                 INSERT INTO app_settings (key, value) VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value
@@ -288,18 +291,9 @@ async def update_ozon(request: Request):
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO app_settings (key, value) VALUES ('ozon_status', ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-    """, (status,))
-    cur.execute("""
-        INSERT INTO app_settings (key, value) VALUES ('ozon_link', ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-    """, (link,))
-    cur.execute("""
-        INSERT INTO app_settings (key, value) VALUES ('ozon_ready_timestamp', ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-    """, (str(ready_ts),))
+    cur.execute("INSERT INTO app_settings (key, value) VALUES ('ozon_status', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (status,))
+    cur.execute("INSERT INTO app_settings (key, value) VALUES ('ozon_link', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (link,))
+    cur.execute("INSERT INTO app_settings (key, value) VALUES ('ozon_ready_timestamp', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(ready_ts),))
     
     now_time = datetime.now().strftime("%H:%M")
     now_ts = int(datetime.now().timestamp() * 1000)
@@ -335,6 +329,20 @@ async def add_referral(request: Request):
     cur.execute("INSERT OR IGNORE INTO referrals (user_id, friend_username, friend_name, earned, created_at) VALUES (?, ?, ?, 0, ?)", (user_id, friend_username, friend_name, now_date))
     conn.commit()
     conn.close()
+    return {"ok": True}
+
+@app.post("/api/referral/withdraw")
+async def withdraw_referral(request: Request):
+    data = await request.json()
+    user_id = data.get("userId")
+    username = (data.get("username") or "client").replace("@", "")
+    amount = float(data.get("amount", 0))
+
+    try:
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]])
+        await bot.send_message(chat_id=ADMIN_ID, text=f"💰 <b>Запрос на вывод реф. бонуса!</b>\nКлиент: @{username}\nСумма: <b>{amount} ₽</b> скином.", reply_markup=admin_kb, parse_mode="HTML")
+    except Exception:
+        pass
     return {"ok": True}
 
 @app.post("/api/task/update")
