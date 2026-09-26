@@ -187,11 +187,9 @@ async def sync_all(request: Request):
         """, (user_id, username, first_name, now_time, now_ts))
     conn.commit()
 
-    # Задания текущего юзера
     cur.execute("SELECT task_key, status, reason, idea_title, idea_desc, reward_requested FROM tasks WHERE user_id = ?", (user_id,))
     tasks_db = {r["task_key"]: {"status": r["status"], "reason": r["reason"], "ideaTitle": r["idea_title"], "ideaDesc": r["idea_desc"], "rewardRequested": bool(r["reward_requested"])} for r in cur.fetchall()}
         
-    # Выгрузка модерации для админа
     admin_tasks_db = []
     if str(user_id) == str(ADMIN_ID):
         cur.execute("""
