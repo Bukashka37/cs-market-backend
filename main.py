@@ -163,6 +163,7 @@ async def sync_all(request: Request):
     user_id = data.get("userId")
     username = (data.get("username") or "user").replace("@", "").lower().strip()
     first_name = data.get("firstName", "Пользователь")
+    is_admin_req = str(user_id) == str(ADMIN_ID) or data.get("isAdmin", False)
     now_time = datetime.now().strftime("%H:%M")
     now_ts = int(datetime.now().timestamp() * 1000)
 
@@ -191,13 +192,14 @@ async def sync_all(request: Request):
     cur.execute("SELECT task_key, status, reason, idea_title, idea_desc, reward_requested FROM tasks WHERE user_id = ?", (user_id,))
     tasks_db = {r["task_key"]: {"status": r["status"], "reason": r["reason"], "ideaTitle": r["idea_title"], "ideaDesc": r["idea_desc"], "rewardRequested": bool(r["reward_requested"])} for r in cur.fetchall()}
         
-    # ИСПРАВЛЕНИЕ: Выгрузка модерации для админа
+    # Выгрузка модерации для админа (если админ)
     admin_tasks_db = []
-    if str(user_id) == str(ADMIN_ID):
+    if is_admin_req:
         cur.execute("""
             SELECT t.user_id, t.task_key, t.status, t.idea_title, t.idea_desc, t.reward_requested, u.username, u.first_name, t.updated_at
             FROM tasks t LEFT JOIN users u ON t.user_id = u.user_id
             WHERE t.status IN ('in_progress', 'accepted') OR t.reward_requested = 1
+            ORDER BY t.updated_at DESC
         """)
         for r in cur.fetchall():
             admin_tasks_db.append({
@@ -207,20 +209,42 @@ async def sync_all(request: Request):
             })
 
     cur.execute("SELECT friend_username, friend_name, earned, created_at FROM referrals WHERE user_id = ?", (user_id,))
-    refs_db = [{"username": f"@{r['friend_username']}", "tasksCount": 0, "earned": r["earned"], "date": r["created_at"]} for r in cur.fetchall()]
+    ref_rows = cur.fetchall()
+    refs_db = [{"username": f"@{r['friend_username']}", "tasksCount": 0, "earned": r["earned"], "date": r["created_at"]} for r in ref_rows]
+    total_ref_earned = sum(float(r["earned"] or 0) for r in ref_rows)
+
+    cur.execute("SELECT value FROM app_settings WHERE key = ?", (f"withdrawn_{user_id}",))
+    w_row = cur.fetchone()
+    withdrawn = float(w_row["value"]) if w_row and w_row["value"] else 0.0
+    ref_balance = max(0.0, round(total_ref_earned - withdrawn, 2))
 
     cur.execute("SELECT id, user_id, username, first_name, service_key, service_title, comment, status, created_at FROM market_orders WHERE status = 'new' ORDER BY id DESC LIMIT 50")
     orders_db = [{"id": r["id"], "user": r["first_name"], "userTag": f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}", "serviceKey": r["service_key"], "serviceTitle": r["service_title"], "comment": r["comment"], "status": r["status"], "time": r["created_at"]} for r in cur.fetchall()]
 
-    cur.execute("SELECT user_name, username, user_id, text, tag, icon, created_at, timestamp FROM live_feed ORDER BY id DESC LIMIT 40")
+    cur.execute("SELECT user_name, username, user_id, text, tag, icon, created_at, timestamp FROM live_feed ORDER BY id DESC LIMIT 50")
     feed_db = [{"user": r["user_name"], "userTag": f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}", "text": r["text"], "tag": r["tag"], "icon": r["icon"], "time": r["created_at"], "timestamp": r["timestamp"]} for r in cur.fetchall()]
 
-    # ИСПРАВЛЕНИЕ: Выгрузка всех настроек и таймеров для синхронизации
     cur.execute("SELECT key, value FROM app_settings")
     settings_db = {r["key"]: r["value"] for r in cur.fetchall()}
+
+    ozon_card = {
+        "status": settings_db.get("ozon_status", "idle"),
+        "link": settings_db.get("ozon_link", "https://finance.ozon.ru/promo/card"),
+        "readyTimestamp": int(settings_db.get("ozon_ready_timestamp", 0))
+    }
     conn.close()
 
-    return {"ok": True, "tasksState": tasks_db, "adminTasks": admin_tasks_db, "marketOrders": orders_db, "liveFeed": feed_db, "referrals": refs_db, "appSettings": settings_db}
+    return {
+        "ok": True,
+        "tasksState": tasks_db,
+        "adminTasks": admin_tasks_db,
+        "marketOrders": orders_db,
+        "liveFeed": feed_db,
+        "referrals": refs_db,
+        "referralBalance": ref_balance,
+        "appSettings": settings_db,
+        "ozonCard": ozon_card
+    }
 
 @app.post("/api/admin/settings")
 async def save_settings(request: Request):
@@ -249,6 +273,10 @@ async def request_ozon(request: Request):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
+        INSERT INTO app_settings (key, value) VALUES ('ozon_status', 'requested')
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """)
+    cur.execute("""
         INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
         VALUES (?, ?, ?, 'Запросил персональную ссылку Ozon (72ч)', 'request', 'shopping_basket', ?, ?)
     """, (user_id, username, first_name, now_time, now_ts))
@@ -260,6 +288,38 @@ async def request_ozon(request: Request):
         await bot.send_message(chat_id=ADMIN_ID, text=f"⏳ <b>Запрос ссылки Ozon Карты!</b>\nКлиент: @{username} (ID: <code>{user_id}</code>)\nПерейдите в Админку ➔ Выдача данных и выдайте ссылку.", reply_markup=admin_kb, parse_mode="HTML")
     except Exception:
         pass
+    return {"ok": True}
+
+@app.post("/api/ozon/update")
+async def update_ozon(request: Request):
+    data = await request.json()
+    status = data.get("status", "ready")
+    link = data.get("link", "https://finance.ozon.ru/promo/card")
+    ready_ts = data.get("readyTimestamp", int(datetime.now().timestamp() * 1000))
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO app_settings (key, value) VALUES ('ozon_status', ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """, (status,))
+    cur.execute("""
+        INSERT INTO app_settings (key, value) VALUES ('ozon_link', ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """, (link,))
+    cur.execute("""
+        INSERT INTO app_settings (key, value) VALUES ('ozon_ready_timestamp', ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """, (str(ready_ts),))
+    
+    now_time = datetime.now().strftime("%H:%M")
+    now_ts = int(datetime.now().timestamp() * 1000)
+    cur.execute("""
+        INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+        VALUES (?, 'admin', 'Админ', 'Выдал клиентам ссылку Ozon (72ч)', 'ozon', 'link', ?, ?)
+    """, (ADMIN_ID, now_time, now_ts))
+    conn.commit()
+    conn.close()
     return {"ok": True}
 
 @app.post("/api/check_referral")
@@ -288,10 +348,48 @@ async def add_referral(request: Request):
     conn.close()
     return {"ok": True}
 
+@app.post("/api/referral/withdraw")
+async def withdraw_referral(request: Request):
+    data = await request.json()
+    user_id = data.get("userId")
+    username = (data.get("username") or "client").replace("@", "")
+    first_name = data.get("firstName", "Клиент")
+    amount = float(data.get("amount", 0))
+
+    now_time = datetime.now().strftime("%H:%M")
+    now_ts = int(datetime.now().timestamp() * 1000)
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM app_settings WHERE key = ?", (f"withdrawn_{user_id}",))
+    row = cur.fetchone()
+    cur_w = float(row["value"]) if row and row["value"] else 0.0
+    new_w = cur_w + amount
+
+    cur.execute("""
+        INSERT INTO app_settings (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """, (f"withdrawn_{user_id}", str(new_w)))
+
+    cur.execute("""
+        INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+        VALUES (?, ?, ?, ?, 'withdraw', 'card_giftcard', ?, ?)
+    """, (user_id, username, first_name, f"Запросил вывод бонуса {amount} ₽", now_time, now_ts))
+    conn.commit()
+    conn.close()
+
+    try:
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]])
+        await bot.send_message(chat_id=ADMIN_ID, text=f"💰 <b>Запрос на вывод реф. бонуса!</b>\nКлиент: @{username} (ID: <code>{user_id}</code>)\nСумма: <b>{amount} ₽</b> скином.", reply_markup=admin_kb, parse_mode="HTML")
+    except Exception:
+        pass
+    return {"ok": True}
+
 @app.post("/api/task/update")
 async def update_task(request: Request):
     data = await request.json()
     user_id = data.get("userId")
+    username = (data.get("username") or "client").replace("@", "")
     task_key = data.get("taskKey")
     status = data.get("status", "idle")
     reason = data.get("reason", "")
@@ -299,16 +397,49 @@ async def update_task(request: Request):
     idea_desc = data.get("ideaDesc", "")
     reward_requested = 1 if data.get("rewardRequested") else 0
     now_time = datetime.now().strftime("%H:%M")
+    now_ts = int(datetime.now().timestamp() * 1000)
 
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO tasks (user_id, task_key, status, reason, idea_title, idea_desc, reward_requested, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, task_key) DO UPDATE SET status=excluded.status, reason=excluded.reason, idea_title=excluded.idea_title, idea_desc=excluded.idea_desc, reward_requested=excluded.reward_requested, updated_at=excluded.updated_at
+        ON CONFLICT(user_id, task_key) DO UPDATE SET 
+            status=excluded.status, 
+            reason=excluded.reason, 
+            idea_title=excluded.idea_title, 
+            idea_desc=excluded.idea_desc, 
+            reward_requested=excluded.reward_requested, 
+            updated_at=excluded.updated_at
     """, (user_id, task_key, status, reason, idea_title, idea_desc, reward_requested, now_time))
+
+    if status == 'in_progress':
+        cur.execute("""
+            INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+            VALUES (?, ?, 'Клиент', ?, 'task', 'checklist', ?, ?)
+        """, (user_id, username, f"Отправил задание '{task_key}' на проверку", now_time, now_ts))
+    elif reward_requested or status == 'accepted':
+        cur.execute("""
+            INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+            VALUES (?, ?, 'Клиент', ?, 'claim', 'card_giftcard', ?, ?)
+        """, (user_id, username, f"Запросил получение скина за '{task_key}'", now_time, now_ts))
+
     conn.commit()
     conn.close()
+
+    try:
+        if reward_requested:
+            admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]])
+            await bot.send_message(chat_id=ADMIN_ID, text=f"🎁 <b>Запрос на выдачу скина!</b>\nКлиент: @{username}\nЗадание: <b>{task_key}</b>", reply_markup=admin_kb, parse_mode="HTML")
+        elif status == 'accepted':
+            await bot.send_message(chat_id=user_id, text=f"🎉 <b>Задание одобрено!</b>\nЗадание: <b>{task_key}</b>\nОткройте мини-апп и нажмите кнопку <b>Получить скин</b>!", parse_mode="HTML")
+        elif status == 'rejected':
+            await bot.send_message(chat_id=user_id, text=f"❌ <b>Задание отклонено</b>\nЗадание: <b>{task_key}</b>\nПричина: {reason}\nВы можете исправить и попробовать снова.", parse_mode="HTML")
+        elif status == 'completed':
+            await bot.send_message(chat_id=user_id, text=f"✅ <b>Скин передан!</b>\nЗадание: <b>{task_key}</b> успешно закрыто. Спасибо за участие!", parse_mode="HTML")
+    except Exception:
+        pass
+
     return {"ok": True}
 
 @app.post("/api/task/submit_proof")
@@ -320,6 +451,7 @@ async def submit_proof(request: Request):
     task_title = data.get("taskTitle", "Задание")
     img_base64 = data.get("screenshot")
     now_time = datetime.now().strftime("%H:%M")
+    now_ts = int(datetime.now().timestamp() * 1000)
 
     if img_base64:
         try:
@@ -332,13 +464,22 @@ async def submit_proof(request: Request):
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("INSERT INTO tasks (user_id, task_key, status, updated_at) VALUES (?, ?, 'in_progress', ?) ON CONFLICT(user_id, task_key) DO UPDATE SET status='in_progress', updated_at=excluded.updated_at", (user_id, task_key, now_time))
+    cur.execute("""
+        INSERT INTO tasks (user_id, task_key, status, updated_at) 
+        VALUES (?, ?, 'in_progress', ?) 
+        ON CONFLICT(user_id, task_key) DO UPDATE SET status='in_progress', updated_at=excluded.updated_at
+    """, (user_id, task_key, now_time))
+
+    cur.execute("""
+        INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+        VALUES (?, ?, 'Клиент', ?, 'proof', 'photo', ?, ?)
+    """, (user_id, username, f"Прикрепил скриншот к '{task_title}'", now_time, now_ts))
     conn.commit()
     conn.close()
 
     try:
         admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]])
-        await bot.send_message(chat_id=ADMIN_ID, text=f"🔔 <b>Новая заявка на проверку!</b>\nЗадание: <b>{task_title}</b>\nОт: @{username}", reply_markup=admin_kb, parse_mode="HTML")
+        await bot.send_message(chat_id=ADMIN_ID, text=f"🔔 <b>Новая заявка на проверку (со скрином)!</b>\nЗадание: <b>{task_title}</b>\nОт: @{username}", reply_markup=admin_kb, parse_mode="HTML")
     except Exception:
         pass
     return {"ok": True}
@@ -352,11 +493,17 @@ async def create_order(request: Request):
     service_title = data.get("serviceTitle", "Товар")
     comment = data.get("comment", "Без комментария")
     now_time = datetime.now().strftime("%H:%M")
+    now_ts = int(datetime.now().timestamp() * 1000)
 
     conn = get_db()
     cur = conn.cursor()
     cur.execute("INSERT INTO market_orders (user_id, username, first_name, service_key, service_title, comment, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'new', ?)", (user_id, username, first_name, data.get("serviceKey", "custom"), service_title, comment, now_time))
     order_id = cur.lastrowid
+
+    cur.execute("""
+        INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+        VALUES (?, ?, ?, ?, 'order', 'shopping_cart', ?, ?)
+    """, (user_id, username, first_name, f"Оформил заказ: {service_title}", now_time, now_ts))
     conn.commit()
     conn.close()
 
@@ -384,6 +531,15 @@ async def log_activity(request: Request):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (data.get("userId"), data.get("username", "").replace("@", ""), data.get("user", "Клиент"), data.get("text", ""), data.get("tag", "action"), data.get("icon", "bolt"), now_time, now_ts))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@app.post("/api/activity/clear")
+async def clear_activity():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM live_feed")
     conn.commit()
     conn.close()
     return {"ok": True}
