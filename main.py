@@ -12,7 +12,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "707417409"))
+ADMIN_ID = os.getenv("ADMIN_ID", "707417409")
 CHANNEL_STORAGE_ID = int(os.getenv("CHANNEL_STORAGE_ID", "-1003931747114"))
 
 bot = Bot(token=BOT_TOKEN)
@@ -90,13 +90,6 @@ def init_db():
         )
     """)
     conn.commit()
-    cur.execute("""
-        DELETE FROM market_orders 
-        WHERE id NOT IN (
-            SELECT MIN(id) FROM market_orders GROUP BY user_id, service_key, comment, status
-        )
-    """)
-    conn.commit()
     conn.close()
 
 init_db()
@@ -131,7 +124,6 @@ async def cmd_start(message: types.Message):
     user = message.from_user
     now_time = datetime.now().strftime("%H:%M")
     now_ts = int(datetime.now().timestamp() * 1000)
-
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
@@ -147,7 +139,6 @@ async def cmd_start(message: types.Message):
         INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
         VALUES (?, ?, ?, 'Запустил бота в Telegram', 'bot_start', 'smart_toy', ?, ?)
     """, (user.id, (user.username or "").lower(), user.first_name, now_time, now_ts))
-
     conn.commit()
     conn.close()
 
@@ -194,114 +185,57 @@ async def sync_all(request: Request):
             INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
             VALUES (?, ?, ?, 'Открыл приложение CS:GO Market', 'login', 'login', ?, ?)
         """, (user_id, username, first_name, now_time, now_ts))
-
-    migrate_tasks = data.get("migrateTasks", {})
-    if isinstance(migrate_tasks, dict):
-        for t_key, t_val in migrate_tasks.items():
-            t_status = "idle"
-            t_reason = ""
-            if isinstance(t_val, dict):
-                t_status = t_val.get("status", "idle")
-                t_reason = t_val.get("reason", "")
-            elif isinstance(t_val, str):
-                t_status = t_val
-
-            if t_status and t_status != "idle":
-                cur.execute("""
-                    INSERT OR IGNORE INTO tasks (user_id, task_key, status, reason, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (user_id, t_key, t_status, t_reason, now_time))
-
-    migrate_orders = data.get("migrateOrders", [])
-    if isinstance(migrate_orders, list):
-        for o in migrate_orders:
-            if o.get("status") == "new":
-                cur.execute("""
-                    INSERT OR IGNORE INTO market_orders (user_id, username, first_name, service_key, service_title, comment, status, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'new', ?)
-                """, (user_id, username, first_name, o.get("serviceKey", "custom"), o.get("serviceTitle", "Товар"), o.get("comment", ""), o.get("time", now_time)))
-
     conn.commit()
 
     # Задания текущего юзера
     cur.execute("SELECT task_key, status, reason, idea_title, idea_desc, reward_requested FROM tasks WHERE user_id = ?", (user_id,))
-    tasks_db = {}
-    for r in cur.fetchall():
-        tasks_db[r["task_key"]] = {
-            "status": r["status"],
-            "reason": r["reason"],
-            "ideaTitle": r["idea_title"],
-            "ideaDesc": r["idea_desc"],
-            "rewardRequested": bool(r["reward_requested"])
-        }
+    tasks_db = {r["task_key"]: {"status": r["status"], "reason": r["reason"], "ideaTitle": r["idea_title"], "ideaDesc": r["idea_desc"], "rewardRequested": bool(r["reward_requested"])} for r in cur.fetchall()}
         
-    # ВСЕ ЗАДАНИЯ ВСЕХ ЮЗЕРОВ (ТОЛЬКО ДЛЯ АДМИНА)
+    # ИСПРАВЛЕНИЕ: Выгрузка модерации для админа
     admin_tasks_db = []
-    if user_id == ADMIN_ID:
+    if str(user_id) == str(ADMIN_ID):
         cur.execute("""
             SELECT t.user_id, t.task_key, t.status, t.idea_title, t.idea_desc, t.reward_requested, u.username, u.first_name, t.updated_at
-            FROM tasks t
-            LEFT JOIN users u ON t.user_id = u.user_id
+            FROM tasks t LEFT JOIN users u ON t.user_id = u.user_id
             WHERE t.status IN ('in_progress', 'accepted') OR t.reward_requested = 1
         """)
         for r in cur.fetchall():
             admin_tasks_db.append({
-                "userId": r["user_id"],
-                "taskKey": r["task_key"],
-                "status": r["status"],
-                "ideaTitle": r["idea_title"],
-                "ideaDesc": r["idea_desc"],
-                "rewardRequested": bool(r["reward_requested"]),
-                "username": r["username"] or "",
-                "firstName": r["first_name"] or "Клиент",
-                "time": r["updated_at"]
+                "userId": r["user_id"], "taskKey": r["task_key"], "status": r["status"],
+                "ideaTitle": r["idea_title"], "ideaDesc": r["idea_desc"], "rewardRequested": bool(r["reward_requested"]),
+                "username": r["username"] or "", "firstName": r["first_name"] or "Клиент", "time": r["updated_at"]
             })
 
     cur.execute("SELECT friend_username, friend_name, earned, created_at FROM referrals WHERE user_id = ?", (user_id,))
     refs_db = [{"username": f"@{r['friend_username']}", "tasksCount": 0, "earned": r["earned"], "date": r["created_at"]} for r in cur.fetchall()]
 
     cur.execute("SELECT id, user_id, username, first_name, service_key, service_title, comment, status, created_at FROM market_orders WHERE status = 'new' ORDER BY id DESC LIMIT 50")
-    orders_db = []
-    for r in cur.fetchall():
-        orders_db.append({
-            "id": r["id"],
-            "user": r["first_name"],
-            "userTag": f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}",
-            "serviceKey": r["service_key"],
-            "serviceTitle": r["service_title"],
-            "comment": r["comment"],
-            "status": r["status"],
-            "time": r["created_at"]
-        })
+    orders_db = [{"id": r["id"], "user": r["first_name"], "userTag": f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}", "serviceKey": r["service_key"], "serviceTitle": r["service_title"], "comment": r["comment"], "status": r["status"], "time": r["created_at"]} for r in cur.fetchall()]
 
     cur.execute("SELECT user_name, username, user_id, text, tag, icon, created_at, timestamp FROM live_feed ORDER BY id DESC LIMIT 40")
-    feed_db = []
-    for r in cur.fetchall():
-        feed_db.append({
-            "user": r["user_name"],
-            "userTag": f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}",
-            "text": r["text"],
-            "tag": r["tag"],
-            "icon": r["icon"],
-            "time": r["created_at"],
-            "timestamp": r["timestamp"]
-        })
+    feed_db = [{"user": r["user_name"], "userTag": f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}", "text": r["text"], "tag": r["tag"], "icon": r["icon"], "time": r["created_at"], "timestamp": r["timestamp"]} for r in cur.fetchall()]
 
-    cur.execute("SELECT value FROM app_settings WHERE key = 'ozon_card'")
-    ozon_row = cur.fetchone()
-    ozon_data = json.loads(ozon_row["value"]) if ozon_row else None
-
+    # ИСПРАВЛЕНИЕ: Выгрузка всех настроек и таймеров для синхронизации
+    cur.execute("SELECT key, value FROM app_settings")
+    settings_db = {r["key"]: r["value"] for r in cur.fetchall()}
     conn.close()
 
-    return {
-        "ok": True,
-        "tasksState": tasks_db,
-        "adminTasks": admin_tasks_db,
-        "marketOrders": orders_db,
-        "liveFeed": feed_db,
-        "referrals": refs_db,
-        "ozonCard": ozon_data
-    }
+    return {"ok": True, "tasksState": tasks_db, "adminTasks": admin_tasks_db, "marketOrders": orders_db, "liveFeed": feed_db, "referrals": refs_db, "appSettings": settings_db}
+
+@app.post("/api/admin/settings")
+async def save_settings(request: Request):
+    data = await request.json()
+    conn = get_db()
+    cur = conn.cursor()
+    for k, v in data.items():
+        if k not in ["userId", "username", "firstName"]:
+            cur.execute("""
+                INSERT INTO app_settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """, (k, str(v)))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 @app.post("/api/ozon/request")
 async def request_ozon(request: Request):
@@ -314,15 +248,6 @@ async def request_ozon(request: Request):
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT value FROM app_settings WHERE key = 'ozon_card'")
-    row = cur.fetchone()
-    current_ozon = json.loads(row["value"]) if row and row["value"] else {}
-    current_ozon["status"] = "requested"
-    cur.execute("""
-        INSERT INTO app_settings (key, value) VALUES ('ozon_card', ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-    """, (json.dumps(current_ozon),))
-
     cur.execute("""
         INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
         VALUES (?, ?, ?, 'Запросил персональную ссылку Ozon (72ч)', 'request', 'shopping_basket', ?, ?)
@@ -331,33 +256,22 @@ async def request_ozon(request: Request):
     conn.close()
 
     try:
-        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]
-        ])
-        await bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"⏳ <b>Запрос ссылки Ozon Карты!</b>\nКлиент: @{username} (ID: <code>{user_id}</code>)\nПерейдите в Админку ➔ Выдача данных и выдайте ссылку.",
-            reply_markup=admin_kb,
-            parse_mode="HTML"
-        )
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]])
+        await bot.send_message(chat_id=ADMIN_ID, text=f"⏳ <b>Запрос ссылки Ozon Карты!</b>\nКлиент: @{username} (ID: <code>{user_id}</code>)\nПерейдите в Админку ➔ Выдача данных и выдайте ссылку.", reply_markup=admin_kb, parse_mode="HTML")
     except Exception:
         pass
-
     return {"ok": True}
 
 @app.post("/api/check_referral")
 async def check_referral(request: Request):
     data = await request.json()
     ref_username = (data.get("username") or "").replace("@", "").lower().strip()
-
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT user_id, first_name, username FROM users WHERE LOWER(username) = ?", (ref_username,))
     row = cur.fetchone()
     conn.close()
-
-    if row:
-        return {"exists": True, "userId": row["user_id"], "name": row["first_name"]}
+    if row: return {"exists": True, "userId": row["user_id"], "name": row["first_name"]}
     return {"exists": False}
 
 @app.post("/api/referral/add")
@@ -367,13 +281,9 @@ async def add_referral(request: Request):
     friend_username = (data.get("friendUsername") or "").replace("@", "").lower().strip()
     friend_name = data.get("friendName", friend_username)
     now_date = datetime.now().strftime("%d.%m.%Y")
-
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT OR IGNORE INTO referrals (user_id, friend_username, friend_name, earned, created_at)
-        VALUES (?, ?, ?, 0, ?)
-    """, (user_id, friend_username, friend_name, now_date))
+    cur.execute("INSERT OR IGNORE INTO referrals (user_id, friend_username, friend_name, earned, created_at) VALUES (?, ?, ?, 0, ?)", (user_id, friend_username, friend_name, now_date))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -395,13 +305,7 @@ async def update_task(request: Request):
     cur.execute("""
         INSERT INTO tasks (user_id, task_key, status, reason, idea_title, idea_desc, reward_requested, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, task_key) DO UPDATE SET
-            status=excluded.status,
-            reason=excluded.reason,
-            idea_title=excluded.idea_title,
-            idea_desc=excluded.idea_desc,
-            reward_requested=excluded.reward_requested,
-            updated_at=excluded.updated_at
+        ON CONFLICT(user_id, task_key) DO UPDATE SET status=excluded.status, reason=excluded.reason, idea_title=excluded.idea_title, idea_desc=excluded.idea_desc, reward_requested=excluded.reward_requested, updated_at=excluded.updated_at
     """, (user_id, task_key, status, reason, idea_title, idea_desc, reward_requested, now_time))
     conn.commit()
     conn.close()
@@ -422,36 +326,21 @@ async def submit_proof(request: Request):
             header, encoded = img_base64.split(",", 1) if "," in img_base64 else ("", img_base64)
             image_bytes = base64.b64decode(encoded)
             file_payload = BufferedInputFile(image_bytes, filename="proof.jpg")
-            caption = f"📸 <b>Скриншот задания!</b>\n👤 @{username} (ID: <code>{user_id}</code>)\n🎯 <b>{task_title}</b>"
-            await bot.send_photo(chat_id=CHANNEL_STORAGE_ID, photo=file_payload, caption=caption, parse_mode="HTML")
-        except Exception as e:
+            await bot.send_photo(chat_id=CHANNEL_STORAGE_ID, photo=file_payload, caption=f"📸 <b>Скриншот задания!</b>\n👤 @{username} (ID: <code>{user_id}</code>)\n🎯 <b>{task_title}</b>", parse_mode="HTML")
+        except Exception:
             pass
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO tasks (user_id, task_key, status, updated_at)
-        VALUES (?, ?, 'in_progress', ?)
-        ON CONFLICT(user_id, task_key) DO UPDATE SET
-            status='in_progress',
-            updated_at=excluded.updated_at
-    """, (user_id, task_key, now_time))
+    cur.execute("INSERT INTO tasks (user_id, task_key, status, updated_at) VALUES (?, ?, 'in_progress', ?) ON CONFLICT(user_id, task_key) DO UPDATE SET status='in_progress', updated_at=excluded.updated_at", (user_id, task_key, now_time))
     conn.commit()
     conn.close()
 
     try:
-        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]
-        ])
-        await bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"🔔 <b>Новая заявка на проверку!</b>\nЗадание: <b>{task_title}</b>\nОт: @{username}",
-            reply_markup=admin_kb,
-            parse_mode="HTML"
-        )
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]])
+        await bot.send_message(chat_id=ADMIN_ID, text=f"🔔 <b>Новая заявка на проверку!</b>\nЗадание: <b>{task_title}</b>\nОт: @{username}", reply_markup=admin_kb, parse_mode="HTML")
     except Exception:
         pass
-
     return {"ok": True}
 
 @app.post("/api/order/create")
@@ -460,40 +349,27 @@ async def create_order(request: Request):
     user_id = data.get("userId")
     username = (data.get("username") or "client").replace("@", "")
     first_name = data.get("firstName", "Клиент")
-    service_key = data.get("serviceKey", "custom")
     service_title = data.get("serviceTitle", "Товар")
     comment = data.get("comment", "Без комментария")
     now_time = datetime.now().strftime("%H:%M")
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO market_orders (user_id, username, first_name, service_key, service_title, comment, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'new', ?)
-    """, (user_id, username, first_name, service_key, service_title, comment, now_time))
+    cur.execute("INSERT INTO market_orders (user_id, username, first_name, service_key, service_title, comment, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'new', ?)", (user_id, username, first_name, data.get("serviceKey", "custom"), service_title, comment, now_time))
     order_id = cur.lastrowid
     conn.commit()
     conn.close()
 
     try:
-        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Написать в ЛС", url=f"https://t.me/{username}")]
-        ])
-        await bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"🛒 <b>Новый заказ в Маркете!</b>\nУслуга: <b>{service_title}</b>\nКлиент: @{username}\nКомментарий: {comment}",
-            reply_markup=admin_kb,
-            parse_mode="HTML"
-        )
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать в ЛС", url=f"https://t.me/{username}")]])
+        await bot.send_message(chat_id=ADMIN_ID, text=f"🛒 <b>Новый заказ в Маркете!</b>\nУслуга: <b>{service_title}</b>\nКлиент: @{username}\nКомментарий: {comment}", reply_markup=admin_kb, parse_mode="HTML")
     except Exception:
         pass
-
     return {"ok": True, "orderId": order_id}
 
 @app.post("/api/order/complete")
 async def complete_order(request: Request):
-    data = await request.json()
-    order_id = data.get("orderId")
+    order_id = (await request.json()).get("orderId")
     conn = get_db()
     cur = conn.cursor()
     cur.execute("UPDATE market_orders SET status = 'completed' WHERE id = ?", (order_id,))
@@ -501,31 +377,13 @@ async def complete_order(request: Request):
     conn.close()
     return {"ok": True}
 
-@app.post("/api/ozon/update")
-async def update_ozon(request: Request):
-    data = await request.json()
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO app_settings (key, value) VALUES ('ozon_card', ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-    """, (json.dumps(data),))
-    conn.commit()
-    conn.close()
-    return {"ok": True}
-
 @app.post("/api/activity/log")
 async def log_activity(request: Request):
     data = await request.json()
-    now_time = datetime.now().strftime("%H:%M")
-    now_ts = int(datetime.now().timestamp() * 1000)
-
+    now_time, now_ts = datetime.now().strftime("%H:%M"), int(datetime.now().timestamp() * 1000)
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (data.get("userId"), data.get("username", "").replace("@", ""), data.get("user", "Клиент"), data.get("text", ""), data.get("tag", "action"), data.get("icon", "bolt"), now_time, now_ts))
+    cur.execute("INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (data.get("userId"), data.get("username", "").replace("@", ""), data.get("user", "Клиент"), data.get("text", ""), data.get("tag", "action"), data.get("icon", "bolt"), now_time, now_ts))
     conn.commit()
     conn.close()
     return {"ok": True}
