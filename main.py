@@ -1,22 +1,22 @@
 import os
 import base64
+import sqlite3
 import asyncio
 import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-import aiosqlite
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
-# Настройка логирования для отслеживания ошибок (контрольные точки)
+# Настройка логирования для отлова ошибок (теперь они будут видны в логах Render, а не просто "падать")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID", "707417409")
 CHANNEL_STORAGE_ID = int(os.getenv("CHANNEL_STORAGE_ID", "-1003931747114"))
 DB_NAME = "market_bot.db"
@@ -24,92 +24,100 @@ DB_NAME = "market_bot.db"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Асинхронная инициализация БД
-async def init_db():
+# Используем стандартный sqlite3 с защитой блокировок
+def get_db():
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
     try:
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    last_active TEXT
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    user_id INTEGER,
-                    task_key TEXT,
-                    status TEXT DEFAULT 'idle',
-                    reason TEXT DEFAULT '',
-                    idea_title TEXT DEFAULT '',
-                    idea_desc TEXT DEFAULT '',
-                    reward_requested INTEGER DEFAULT 0,
-                    updated_at TEXT,
-                    PRIMARY KEY (user_id, task_key)
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS market_orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    username TEXT,
-                    first_name TEXT,
-                    service_key TEXT,
-                    service_title TEXT,
-                    comment TEXT,
-                    status TEXT DEFAULT 'new',
-                    created_at TEXT
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS live_feed (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    username TEXT,
-                    user_name TEXT,
-                    text TEXT,
-                    tag TEXT,
-                    icon TEXT,
-                    created_at TEXT,
-                    timestamp INTEGER
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS referrals (
-                    user_id INTEGER,
-                    friend_username TEXT,
-                    friend_name TEXT,
-                    earned REAL DEFAULT 0,
-                    created_at TEXT,
-                    PRIMARY KEY (user_id, friend_username)
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS app_settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            """)
-            await db.commit()
-            logger.info("База данных успешно инициализирована.")
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_active TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                user_id INTEGER,
+                task_key TEXT,
+                status TEXT DEFAULT 'idle',
+                reason TEXT DEFAULT '',
+                idea_title TEXT DEFAULT '',
+                idea_desc TEXT DEFAULT '',
+                reward_requested INTEGER DEFAULT 0,
+                updated_at TEXT,
+                PRIMARY KEY (user_id, task_key)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS market_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                first_name TEXT,
+                service_key TEXT,
+                service_title TEXT,
+                comment TEXT,
+                status TEXT DEFAULT 'new',
+                created_at TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS live_feed (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                user_name TEXT,
+                text TEXT,
+                tag TEXT,
+                icon TEXT,
+                created_at TEXT,
+                timestamp INTEGER
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS referrals (
+                user_id INTEGER,
+                friend_username TEXT,
+                friend_name TEXT,
+                earned REAL DEFAULT 0,
+                created_at TEXT,
+                PRIMARY KEY (user_id, friend_username)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+        logger.info("База данных успешно инициализирована.")
     except Exception as e:
-        logger.error(f"Ошибка при инициализации БД: {e}")
+        logger.error(f"Ошибка инициализации БД: {e}")
+
+init_db()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
-        logger.warning(f"Не удалось удалить вебхук: {e}")
-    
+        logger.warning(f"Ошибка удаления вебхука: {e}")
+        
     polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
-    logger.info("Бот начал поллинг.")
+    logger.info("Telegram Бот запущен.")
     yield
     polling_task.cancel()
     await bot.session.close()
-    logger.info("Бот остановлен.")
+    logger.info("Telegram Бот остановлен.")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -132,21 +140,23 @@ async def cmd_start(message: types.Message):
         now_time = datetime.now().strftime("%H:%M")
         now_ts = int(datetime.now().timestamp() * 1000)
         
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("""
-                INSERT INTO users (user_id, username, first_name, last_active)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    username=excluded.username,
-                    first_name=excluded.first_name,
-                    last_active=excluded.last_active
-            """, (user.id, (user.username or "").lower(), user.first_name, now_time))
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (user_id, username, first_name, last_active)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                first_name=excluded.first_name,
+                last_active=excluded.last_active
+        """, (user.id, (user.username or "").lower(), user.first_name, now_time))
 
-            await db.execute("""
-                INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
-                VALUES (?, ?, ?, 'Запустил бота в Telegram', 'bot_start', 'smart_toy', ?, ?)
-            """, (user.id, (user.username or "").lower(), user.first_name, now_time, now_ts))
-            await db.commit()
+        cur.execute("""
+            INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+            VALUES (?, ?, ?, 'Запустил бота в Telegram', 'bot_start', 'smart_toy', ?, ?)
+        """, (user.id, (user.username or "").lower(), user.first_name, now_time, now_ts))
+        conn.commit()
+        conn.close()
 
         try:
             clear_msg = await message.answer("...", reply_markup=types.ReplyKeyboardRemove())
@@ -177,63 +187,64 @@ async def sync_all(request: Request):
         now_time = datetime.now().strftime("%H:%M")
         now_ts = int(datetime.now().timestamp() * 1000)
 
-        async with aiosqlite.connect(DB_NAME) as db:
-            db.row_factory = aiosqlite.Row
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO users (user_id, username, first_name, last_active)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                first_name=excluded.first_name,
+                last_active=excluded.last_active
+        """, (user_id, username, first_name, now_time))
+
+        cur.execute("SELECT timestamp FROM live_feed WHERE user_id = ? AND tag = 'login' ORDER BY id DESC LIMIT 1", (user_id,))
+        last_log = cur.fetchone()
+        if not last_log or (now_ts - last_log["timestamp"]) > 900000:
+            cur.execute("""
+                INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+                VALUES (?, ?, ?, 'Открыл приложение CS:GO Market', 'login', 'login', ?, ?)
+            """, (user_id, username, first_name, now_time, now_ts))
+        conn.commit()
+
+        # Данные для синхронизации
+        cur.execute("SELECT task_key, status, reason, idea_title, idea_desc, reward_requested FROM tasks WHERE user_id = ?", (user_id,))
+        tasks_db = {r["task_key"]: {"status": r["status"], "reason": r["reason"], "ideaTitle": r["idea_title"], "ideaDesc": r["idea_desc"], "rewardRequested": bool(r["reward_requested"])} for r in cur.fetchall()}
             
-            await db.execute("""
-                INSERT INTO users (user_id, username, first_name, last_active)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    username=excluded.username,
-                    first_name=excluded.first_name,
-                    last_active=excluded.last_active
-            """, (user_id, username, first_name, now_time))
+        admin_tasks_db = []
+        if str(user_id) == str(ADMIN_ID) or is_admin:
+            cur.execute("""
+                SELECT t.user_id, t.task_key, t.status, t.idea_title, t.idea_desc, t.reward_requested, u.username, u.first_name, t.updated_at
+                FROM tasks t LEFT JOIN users u ON t.user_id = u.user_id
+                WHERE t.status IN ('in_progress', 'accepted') OR t.reward_requested = 1
+                ORDER BY t.updated_at DESC
+            """)
+            for r in cur.fetchall():
+                admin_tasks_db.append({
+                    "userId": r["user_id"], "taskKey": r["task_key"], "status": r["status"],
+                    "ideaTitle": r["idea_title"], "ideaDesc": r["idea_desc"], "rewardRequested": bool(r["reward_requested"]),
+                    "username": r["username"] or "", "firstName": r["first_name"] or "Клиент", "time": r["updated_at"]
+                })
 
-            async with db.execute("SELECT timestamp FROM live_feed WHERE user_id = ? AND tag = 'login' ORDER BY id DESC LIMIT 1", (user_id,)) as cursor:
-                last_log = await cursor.fetchone()
-                if not last_log or (now_ts - last_log["timestamp"]) > 900000:
-                    await db.execute("""
-                        INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
-                        VALUES (?, ?, ?, 'Открыл приложение CS:GO Market', 'login', 'login', ?, ?)
-                    """, (user_id, username, first_name, now_time, now_ts))
-            await db.commit()
+        cur.execute("SELECT friend_username, friend_name, earned, created_at FROM referrals WHERE user_id = ?", (user_id,))
+        refs_db = [{"username": f"@{r['friend_username']}", "tasksCount": 0, "earned": r["earned"], "date": r["created_at"]} for r in cur.fetchall()]
 
-            # Получение заданий пользователя
-            async with db.execute("SELECT task_key, status, reason, idea_title, idea_desc, reward_requested FROM tasks WHERE user_id = ?", (user_id,)) as cursor:
-                tasks_db = {r["task_key"]: {"status": r["status"], "reason": r["reason"], "ideaTitle": r["idea_title"], "ideaDesc": r["idea_desc"], "rewardRequested": bool(r["reward_requested"])} for r in await cursor.fetchall()}
-                
-            admin_tasks_db = []
-            if str(user_id) == str(ADMIN_ID) or is_admin:
-                async with db.execute("""
-                    SELECT t.user_id, t.task_key, t.status, t.idea_title, t.idea_desc, t.reward_requested, u.username, u.first_name, t.updated_at
-                    FROM tasks t LEFT JOIN users u ON t.user_id = u.user_id
-                    WHERE t.status IN ('in_progress', 'accepted') OR t.reward_requested = 1
-                    ORDER BY t.updated_at DESC
-                """) as cursor:
-                    for r in await cursor.fetchall():
-                        admin_tasks_db.append({
-                            "userId": r["user_id"], "taskKey": r["task_key"], "status": r["status"],
-                            "ideaTitle": r["idea_title"], "ideaDesc": r["idea_desc"], "rewardRequested": bool(r["reward_requested"]),
-                            "username": r["username"] or "", "firstName": r["first_name"] or "Клиент", "time": r["updated_at"]
-                        })
+        cur.execute("SELECT id, user_id, username, first_name, service_key, service_title, comment, status, created_at FROM market_orders WHERE status = 'new' ORDER BY id DESC LIMIT 50")
+        orders_db = [{"id": r["id"], "user": r["first_name"], "userTag": f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}", "serviceKey": r["service_key"], "serviceTitle": r["service_title"], "comment": r["comment"], "status": r["status"], "time": r["created_at"]} for r in cur.fetchall()]
 
-            async with db.execute("SELECT friend_username, friend_name, earned, created_at FROM referrals WHERE user_id = ?", (user_id,)) as cursor:
-                refs_db = [{"username": f"@{r['friend_username']}", "tasksCount": 0, "earned": r["earned"], "date": r["created_at"]} for r in await cursor.fetchall()]
+        cur.execute("SELECT user_name, username, user_id, text, tag, icon, created_at, timestamp FROM live_feed ORDER BY id DESC LIMIT 40")
+        feed_db = [{"user": r["user_name"], "userTag": f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}", "text": r["text"], "tag": r["tag"], "icon": r["icon"], "time": r["created_at"], "timestamp": r["timestamp"]} for r in cur.fetchall()]
 
-            async with db.execute("SELECT id, user_id, username, first_name, service_key, service_title, comment, status, created_at FROM market_orders WHERE status = 'new' ORDER BY id DESC LIMIT 50") as cursor:
-                orders_db = [{"id": r["id"], "user": r["first_name"], "userTag": f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}", "serviceKey": r["service_key"], "serviceTitle": r["service_title"], "comment": r["comment"], "status": r["status"], "time": r["created_at"]} for r in await cursor.fetchall()]
+        cur.execute("SELECT key, value FROM app_settings")
+        settings_db = {r["key"]: r["value"] for r in cur.fetchall()}
 
-            async with db.execute("SELECT user_name, username, user_id, text, tag, icon, created_at, timestamp FROM live_feed ORDER BY id DESC LIMIT 40") as cursor:
-                feed_db = [{"user": r["user_name"], "userTag": f"@{r['username']}" if r["username"] else f"ID:{r['user_id']}", "text": r["text"], "tag": r["tag"], "icon": r["icon"], "time": r["created_at"], "timestamp": r["timestamp"]} for r in await cursor.fetchall()]
-
-            async with db.execute("SELECT key, value FROM app_settings") as cursor:
-                settings_db = {r["key"]: r["value"] for r in await cursor.fetchall()}
-
-            ozon_card = {
-                "status": settings_db.get("ozon_status", "idle"),
-                "link": settings_db.get("ozon_link", "https://finance.ozon.ru/promo/card"),
-                "readyTimestamp": int(settings_db.get("ozon_ready_timestamp", 0))
-            }
+        ozon_card = {
+            "status": settings_db.get("ozon_status", "idle"),
+            "link": settings_db.get("ozon_link", "https://finance.ozon.ru/promo/card"),
+            "readyTimestamp": int(settings_db.get("ozon_ready_timestamp", 0))
+        }
+        conn.close()
 
         return {
             "ok": True,
@@ -246,24 +257,26 @@ async def sync_all(request: Request):
             "ozonCard": ozon_card
         }
     except Exception as e:
-        logger.error(f"Ошибка при синхронизации (/api/sync): {e}", exc_info=True)
+        logger.error(f"Ошибка в /api/sync: {e}", exc_info=True)
         return {"ok": False, "error": str(e)}
 
 @app.post("/api/admin/settings")
 async def save_settings(request: Request):
     try:
         data = await request.json()
-        async with aiosqlite.connect(DB_NAME) as db:
-            for k, v in data.items():
-                if k not in ["userId", "username", "firstName", "isAdmin"]:
-                    await db.execute("""
-                        INSERT INTO app_settings (key, value) VALUES (?, ?)
-                        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                    """, (k, str(v)))
-            await db.commit()
+        conn = get_db()
+        cur = conn.cursor()
+        for k, v in data.items():
+            if k not in ["userId", "username", "firstName", "isAdmin"]:
+                cur.execute("""
+                    INSERT INTO app_settings (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """, (k, str(v)))
+        conn.commit()
+        conn.close()
         return {"ok": True}
     except Exception as e:
-        logger.error(f"Ошибка сохранения настроек: {e}", exc_info=True)
+        logger.error(f"Ошибка в save_settings: {e}")
         return {"ok": False}
 
 @app.post("/api/ozon/request")
@@ -276,26 +289,29 @@ async def request_ozon(request: Request):
         now_time = datetime.now().strftime("%H:%M")
         now_ts = int(datetime.now().timestamp() * 1000)
 
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("""
-                INSERT INTO app_settings (key, value) VALUES ('ozon_status', 'requested')
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            """)
-            await db.execute("""
-                INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
-                VALUES (?, ?, ?, 'Запросил персональную ссылку Ozon (72ч)', 'request', 'shopping_basket', ?, ?)
-            """, (user_id, username, first_name, now_time, now_ts))
-            await db.commit()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO app_settings (key, value) VALUES ('ozon_status', 'requested')
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """)
+        cur.execute("""
+            INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+            VALUES (?, ?, ?, 'Запросил персональную ссылку Ozon (72ч)', 'request', 'shopping_basket', ?, ?)
+        """, (user_id, username, first_name, now_time, now_ts))
+        conn.commit()
+        conn.close()
 
+        # Уведомление администратору (восстановлено)
         try:
             admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]])
             await bot.send_message(chat_id=ADMIN_ID, text=f"⏳ <b>Запрос ссылки Ozon Карты!</b>\nКлиент: @{username} (ID: <code>{user_id}</code>)\nПерейдите в Админку ➔ Выдача данных и выдайте ссылку.", reply_markup=admin_kb, parse_mode="HTML")
         except Exception as e:
-            logger.warning(f"Не удалось отправить уведомление админу: {e}")
+            logger.warning(f"Ошибка отправки уведомления админу: {e}")
             
         return {"ok": True}
     except Exception as e:
-        logger.error(f"Ошибка /api/ozon/request: {e}", exc_info=True)
+        logger.error(f"Ошибка /api/ozon/request: {e}")
         return {"ok": False}
 
 @app.post("/api/ozon/update")
@@ -306,21 +322,23 @@ async def update_ozon(request: Request):
         link = data.get("link", "https://finance.ozon.ru/promo/card")
         ready_ts = data.get("readyTimestamp", int(datetime.now().timestamp() * 1000))
 
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("INSERT INTO app_settings (key, value) VALUES ('ozon_status', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (status,))
-            await db.execute("INSERT INTO app_settings (key, value) VALUES ('ozon_link', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (link,))
-            await db.execute("INSERT INTO app_settings (key, value) VALUES ('ozon_ready_timestamp', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(ready_ts),))
-            
-            now_time = datetime.now().strftime("%H:%M")
-            now_ts = int(datetime.now().timestamp() * 1000)
-            await db.execute("""
-                INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
-                VALUES (?, 'admin', 'Админ', 'Выдал клиентам ссылку Ozon (72ч)', 'ozon', 'link', ?, ?)
-            """, (ADMIN_ID, now_time, now_ts))
-            await db.commit()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO app_settings (key, value) VALUES ('ozon_status', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (status,))
+        cur.execute("INSERT INTO app_settings (key, value) VALUES ('ozon_link', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (link,))
+        cur.execute("INSERT INTO app_settings (key, value) VALUES ('ozon_ready_timestamp', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(ready_ts),))
+        
+        now_time = datetime.now().strftime("%H:%M")
+        now_ts = int(datetime.now().timestamp() * 1000)
+        cur.execute("""
+            INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp)
+            VALUES (?, 'admin', 'Админ', 'Выдал клиентам ссылку Ozon (72ч)', 'ozon', 'link', ?, ?)
+        """, (ADMIN_ID, now_time, now_ts))
+        conn.commit()
+        conn.close()
         return {"ok": True}
     except Exception as e:
-        logger.error(f"Ошибка /api/ozon/update: {e}", exc_info=True)
+        logger.error(f"Ошибка /api/ozon/update: {e}")
         return {"ok": False}
 
 @app.post("/api/check_referral")
@@ -328,12 +346,12 @@ async def check_referral(request: Request):
     try:
         data = await request.json()
         ref_username = (data.get("username") or "").replace("@", "").lower().strip()
-        async with aiosqlite.connect(DB_NAME) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT user_id, first_name, username FROM users WHERE LOWER(username) = ?", (ref_username,)) as cursor:
-                row = await cursor.fetchone()
-        if row: 
-            return {"exists": True, "userId": row["user_id"], "name": row["first_name"]}
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, first_name, username FROM users WHERE LOWER(username) = ?", (ref_username,))
+        row = cur.fetchone()
+        conn.close()
+        if row: return {"exists": True, "userId": row["user_id"], "name": row["first_name"]}
         return {"exists": False}
     except Exception as e:
         logger.error(f"Ошибка проверки реферала: {e}")
@@ -347,9 +365,12 @@ async def add_referral(request: Request):
         friend_username = (data.get("friendUsername") or "").replace("@", "").lower().strip()
         friend_name = data.get("friendName", friend_username)
         now_date = datetime.now().strftime("%d.%m.%Y")
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("INSERT OR IGNORE INTO referrals (user_id, friend_username, friend_name, earned, created_at) VALUES (?, ?, ?, 0, ?)", (user_id, friend_username, friend_name, now_date))
-            await db.commit()
+        
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO referrals (user_id, friend_username, friend_name, earned, created_at) VALUES (?, ?, ?, 0, ?)", (user_id, friend_username, friend_name, now_date))
+        conn.commit()
+        conn.close()
         return {"ok": True}
     except Exception as e:
         logger.error(f"Ошибка добавления реферала: {e}")
@@ -362,11 +383,13 @@ async def withdraw_referral(request: Request):
         username = (data.get("username") or "client").replace("@", "")
         amount = float(data.get("amount", 0))
 
+        # Уведомление администратору (восстановлено)
         try:
             admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]])
             await bot.send_message(chat_id=ADMIN_ID, text=f"💰 <b>Запрос на вывод реф. бонуса!</b>\nКлиент: @{username}\nСумма: <b>{amount} ₽</b> скином.", reply_markup=admin_kb, parse_mode="HTML")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Ошибка отправки уведомления админу: {e}")
+            
         return {"ok": True}
     except Exception as e:
         logger.error(f"Ошибка вывода рефералов: {e}")
@@ -385,22 +408,24 @@ async def update_task(request: Request):
         reward_requested = 1 if data.get("rewardRequested") else 0
         now_time = datetime.now().strftime("%H:%M")
 
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("""
-                INSERT INTO tasks (user_id, task_key, status, reason, idea_title, idea_desc, reward_requested, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, task_key) DO UPDATE SET 
-                    status=excluded.status, 
-                    reason=excluded.reason, 
-                    idea_title=excluded.idea_title, 
-                    idea_desc=excluded.idea_desc, 
-                    reward_requested=excluded.reward_requested, 
-                    updated_at=excluded.updated_at
-            """, (user_id, task_key, status, reason, idea_title, idea_desc, reward_requested, now_time))
-            await db.commit()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO tasks (user_id, task_key, status, reason, idea_title, idea_desc, reward_requested, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, task_key) DO UPDATE SET 
+                status=excluded.status, 
+                reason=excluded.reason, 
+                idea_title=excluded.idea_title, 
+                idea_desc=excluded.idea_desc, 
+                reward_requested=excluded.reward_requested, 
+                updated_at=excluded.updated_at
+        """, (user_id, task_key, status, reason, idea_title, idea_desc, reward_requested, now_time))
+        conn.commit()
+        conn.close()
         return {"ok": True}
     except Exception as e:
-        logger.error(f"Ошибка обновления задачи: {e}", exc_info=True)
+        logger.error(f"Ошибка обновления задачи: {e}")
         return {"ok": False}
 
 @app.post("/api/task/submit_proof")
@@ -414,6 +439,7 @@ async def submit_proof(request: Request):
         img_base64 = data.get("screenshot")
         now_time = datetime.now().strftime("%H:%M")
 
+        # Отправка скриншота в канал и уведомление админу (восстановлено)
         if img_base64:
             try:
                 header, encoded = img_base64.split(",", 1) if "," in img_base64 else ("", img_base64)
@@ -421,20 +447,23 @@ async def submit_proof(request: Request):
                 file_payload = BufferedInputFile(image_bytes, filename="proof.jpg")
                 await bot.send_photo(chat_id=CHANNEL_STORAGE_ID, photo=file_payload, caption=f"📸 <b>Скриншот задания!</b>\n👤 @{username} (ID: <code>{user_id}</code>)\n🎯 <b>{task_title}</b>", parse_mode="HTML")
             except Exception as e:
-                logger.error(f"Ошибка загрузки скриншота в канал: {e}")
+                logger.error(f"Ошибка загрузки скриншота: {e}")
 
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("INSERT INTO tasks (user_id, task_key, status, updated_at) VALUES (?, ?, 'in_progress', ?) ON CONFLICT(user_id, task_key) DO UPDATE SET status='in_progress', updated_at=excluded.updated_at", (user_id, task_key, now_time))
-            await db.commit()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO tasks (user_id, task_key, status, updated_at) VALUES (?, ?, 'in_progress', ?) ON CONFLICT(user_id, task_key) DO UPDATE SET status='in_progress', updated_at=excluded.updated_at", (user_id, task_key, now_time))
+        conn.commit()
+        conn.close()
 
         try:
             admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]])
             await bot.send_message(chat_id=ADMIN_ID, text=f"🔔 <b>Новая заявка на проверку!</b>\nЗадание: <b>{task_title}</b>\nОт: @{username}", reply_markup=admin_kb, parse_mode="HTML")
         except Exception:
             pass
+            
         return {"ok": True}
     except Exception as e:
-        logger.error(f"Ошибка пруфов: {e}", exc_info=True)
+        logger.error(f"Ошибка пруфов: {e}")
         return {"ok": False}
 
 @app.post("/api/order/create")
@@ -448,31 +477,37 @@ async def create_order(request: Request):
         comment = data.get("comment", "Без комментария")
         now_time = datetime.now().strftime("%H:%M")
 
-        async with aiosqlite.connect(DB_NAME) as db:
-            cursor = await db.execute("INSERT INTO market_orders (user_id, username, first_name, service_key, service_title, comment, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'new', ?)", (user_id, username, first_name, data.get("serviceKey", "custom"), service_title, comment, now_time))
-            order_id = cursor.lastrowid
-            await db.commit()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO market_orders (user_id, username, first_name, service_key, service_title, comment, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'new', ?)", (user_id, username, first_name, data.get("serviceKey", "custom"), service_title, comment, now_time))
+        order_id = cur.lastrowid
+        conn.commit()
+        conn.close()
 
+        # Уведомление администратору (восстановлено)
         try:
             admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать в ЛС", url=f"https://t.me/{username}")]])
             await bot.send_message(chat_id=ADMIN_ID, text=f"🛒 <b>Новый заказ в Маркете!</b>\nУслуга: <b>{service_title}</b>\nКлиент: @{username}\nКомментарий: {comment}", reply_markup=admin_kb, parse_mode="HTML")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Ошибка отправки уведомления админу: {e}")
+            
         return {"ok": True, "orderId": order_id}
     except Exception as e:
-        logger.error(f"Ошибка создания ордера: {e}", exc_info=True)
+        logger.error(f"Ошибка создания заказа: {e}")
         return {"ok": False}
 
 @app.post("/api/order/complete")
 async def complete_order(request: Request):
     try:
         order_id = (await request.json()).get("orderId")
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("UPDATE market_orders SET status = 'completed' WHERE id = ?", (order_id,))
-            await db.commit()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE market_orders SET status = 'completed' WHERE id = ?", (order_id,))
+        conn.commit()
+        conn.close()
         return {"ok": True}
     except Exception as e:
-        logger.error(f"Ошибка завершения ордера: {e}")
+        logger.error(f"Ошибка завершения заказа: {e}")
         return {"ok": False}
 
 @app.post("/api/activity/log")
@@ -480,9 +515,11 @@ async def log_activity(request: Request):
     try:
         data = await request.json()
         now_time, now_ts = datetime.now().strftime("%H:%M"), int(datetime.now().timestamp() * 1000)
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (data.get("userId"), data.get("username", "").replace("@", ""), data.get("user", "Клиент"), data.get("text", ""), data.get("tag", "action"), data.get("icon", "bolt"), now_time, now_ts))
-            await db.commit()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO live_feed (user_id, username, user_name, text, tag, icon, created_at, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (data.get("userId"), data.get("username", "").replace("@", ""), data.get("user", "Клиент"), data.get("text", ""), data.get("tag", "action"), data.get("icon", "bolt"), now_time, now_ts))
+        conn.commit()
+        conn.close()
         return {"ok": True}
     except Exception as e:
         logger.error(f"Ошибка логирования активности: {e}")
@@ -491,9 +528,11 @@ async def log_activity(request: Request):
 @app.post("/api/activity/clear")
 async def clear_activity():
     try:
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("DELETE FROM live_feed")
-            await db.commit()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM live_feed")
+        conn.commit()
+        conn.close()
         return {"ok": True}
     except Exception as e:
         logger.error(f"Ошибка очистки логов: {e}")
