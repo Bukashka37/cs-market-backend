@@ -12,7 +12,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
-# Настройка логирования для отлова ошибок (теперь они будут видны в логах Render, а не просто "падать")
+# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,6 @@ DB_NAME = "market_bot.db"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Используем стандартный sqlite3 с защитой блокировок
 def get_db():
     conn = sqlite3.connect(DB_NAME, timeout=10.0)
     conn.row_factory = sqlite3.Row
@@ -99,7 +98,6 @@ def init_db():
         """)
         conn.commit()
         conn.close()
-        logger.info("База данных успешно инициализирована.")
     except Exception as e:
         logger.error(f"Ошибка инициализации БД: {e}")
 
@@ -110,14 +108,12 @@ async def lifespan(app: FastAPI):
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
-        logger.warning(f"Ошибка удаления вебхука: {e}")
+        pass
         
     polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
-    logger.info("Telegram Бот запущен.")
     yield
     polling_task.cancel()
     await bot.session.close()
-    logger.info("Telegram Бот остановлен.")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -173,7 +169,7 @@ async def cmd_start(message: types.Message):
             reply_markup=kb
         )
     except Exception as e:
-        logger.error(f"Ошибка в cmd_start: {e}", exc_info=True)
+        logger.error(f"Ошибка в cmd_start: {e}")
 
 @app.post("/api/sync")
 async def sync_all(request: Request):
@@ -208,12 +204,12 @@ async def sync_all(request: Request):
             """, (user_id, username, first_name, now_time, now_ts))
         conn.commit()
 
-        # Данные для синхронизации
         cur.execute("SELECT task_key, status, reason, idea_title, idea_desc, reward_requested FROM tasks WHERE user_id = ?", (user_id,))
         tasks_db = {r["task_key"]: {"status": r["status"], "reason": r["reason"], "ideaTitle": r["idea_title"], "ideaDesc": r["idea_desc"], "rewardRequested": bool(r["reward_requested"])} for r in cur.fetchall()}
             
         admin_tasks_db = []
-        if str(user_id) == str(ADMIN_ID) or is_admin:
+        # Отдаем админские данные только если стоит флаг isAdmin от проверенного PIN
+        if is_admin:
             cur.execute("""
                 SELECT t.user_id, t.task_key, t.status, t.idea_title, t.idea_desc, t.reward_requested, u.username, u.first_name, t.updated_at
                 FROM tasks t LEFT JOIN users u ON t.user_id = u.user_id
@@ -257,7 +253,7 @@ async def sync_all(request: Request):
             "ozonCard": ozon_card
         }
     except Exception as e:
-        logger.error(f"Ошибка в /api/sync: {e}", exc_info=True)
+        logger.error(f"Ошибка в /api/sync: {e}")
         return {"ok": False, "error": str(e)}
 
 @app.post("/api/admin/settings")
@@ -302,12 +298,11 @@ async def request_ozon(request: Request):
         conn.commit()
         conn.close()
 
-        # Уведомление администратору (восстановлено)
         try:
             admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]])
             await bot.send_message(chat_id=ADMIN_ID, text=f"⏳ <b>Запрос ссылки Ozon Карты!</b>\nКлиент: @{username} (ID: <code>{user_id}</code>)\nПерейдите в Админку ➔ Выдача данных и выдайте ссылку.", reply_markup=admin_kb, parse_mode="HTML")
         except Exception as e:
-            logger.warning(f"Ошибка отправки уведомления админу: {e}")
+            pass
             
         return {"ok": True}
     except Exception as e:
@@ -383,12 +378,11 @@ async def withdraw_referral(request: Request):
         username = (data.get("username") or "client").replace("@", "")
         amount = float(data.get("amount", 0))
 
-        # Уведомление администратору (восстановлено)
         try:
             admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")]])
             await bot.send_message(chat_id=ADMIN_ID, text=f"💰 <b>Запрос на вывод реф. бонуса!</b>\nКлиент: @{username}\nСумма: <b>{amount} ₽</b> скином.", reply_markup=admin_kb, parse_mode="HTML")
         except Exception as e:
-            logger.warning(f"Ошибка отправки уведомления админу: {e}")
+            pass
             
         return {"ok": True}
     except Exception as e:
@@ -439,7 +433,6 @@ async def submit_proof(request: Request):
         img_base64 = data.get("screenshot")
         now_time = datetime.now().strftime("%H:%M")
 
-        # Отправка скриншота в канал и уведомление админу (восстановлено)
         if img_base64:
             try:
                 header, encoded = img_base64.split(",", 1) if "," in img_base64 else ("", img_base64)
@@ -484,12 +477,11 @@ async def create_order(request: Request):
         conn.commit()
         conn.close()
 
-        # Уведомление администратору (восстановлено)
         try:
             admin_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Написать в ЛС", url=f"https://t.me/{username}")]])
             await bot.send_message(chat_id=ADMIN_ID, text=f"🛒 <b>Новый заказ в Маркете!</b>\nУслуга: <b>{service_title}</b>\nКлиент: @{username}\nКомментарий: {comment}", reply_markup=admin_kb, parse_mode="HTML")
         except Exception as e:
-            logger.warning(f"Ошибка отправки уведомления админу: {e}")
+            pass
             
         return {"ok": True, "orderId": order_id}
     except Exception as e:
