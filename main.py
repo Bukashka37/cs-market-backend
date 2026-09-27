@@ -193,7 +193,6 @@ async def sync_all(request: Request):
     tasks_db = {r["task_key"]: {"status": r["status"], "reason": r["reason"], "ideaTitle": r["idea_title"], "ideaDesc": r["idea_desc"], "rewardRequested": bool(r["reward_requested"])} for r in cur.fetchall()}
         
     admin_tasks_db = []
-    # Если это вы по ID или вы ввели верный пароль 789
     if str(user_id) == str(ADMIN_ID) or is_admin:
         cur.execute("""
             SELECT t.user_id, t.task_key, t.status, t.idea_title, t.idea_desc, t.reward_requested, u.username, u.first_name, t.updated_at
